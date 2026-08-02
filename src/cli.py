@@ -181,7 +181,8 @@ def cmd_book(args):
     print(f"   ✓ 分块完成: {len(chunks)} 段, {total_target} 字")
     if args.verbose:
         for i, c in enumerate(chunks):
-            first = c.get("target", "").strip()[:30].splitlines()[0]
+            target_text = c.get("target", "").strip()
+            first = target_text[:30].splitlines()[0] if target_text else "(空)"
             print(f"      No.{i+1:>4}  {len(c.get('target','')):>6}字  {first}")
 
     # ── Step 2: Proofread ──
@@ -312,6 +313,24 @@ def cmd_special(args):
     print(f"📄 详细结果已保存: {csv_path}")
 
 
+# ── 子命令: 最大化检查模式 ───────────────────────────────────────────
+
+
+def cmd_max(args):
+    """最大化检查：确定性检查 + LLM 审校 + 句子对齐 + 综合报告。"""
+    from .max_pipeline import run_max
+
+    results = run_max(
+        args.file, model=args.model, concurrent=args.concurrent,
+        rpm=args.rpm, run_names=args.names, verbose=args.verbose)
+
+    # 自动打开 master 报告
+    if not args.no_view and results.get("report_path"):
+        url = f"file://{Path(results['report_path']).resolve()}"
+        webbrowser.open(url)
+        print(f"🌐 报告已打开: {url}")
+
+
 # ── 主入口 ─────────────────────────────────────────────────────────────
 
 
@@ -321,19 +340,23 @@ def main():
         description="ai-proofread 命令行工具 — 终端直接调用审校，无需 VSCode",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
-子命令简写:  p=proofread  b=book  d=diff  s=special
+子命令简写:  p=proofread  b=book  m=max  d=diff  s=special
 
 示例:
   proofread p 我的稿件.docx
   proofread p 我的稿件.md --context 上下文.md --ref 参考资料.md
   proofread b 我的稿件.docx --concurrent 5
+  proofread m 我的稿件.docx              # ★ 最大化检查（全环节）
+  proofread m 我的稿件.docx --names      # 含专名查词
   proofread d 原稿.md 校后.md
   proofread s 我的稿件.md
 
 默认模型: {DEFAULT_MODEL}（DeepSeek V4 Flash）
         """,
     )
+    # 全局参数
     parser.add_argument("--verbose", "-v", action="store_true", help="详细输出")
+    parser.set_defaults(verbose=False)
     sub = parser.add_subparsers(dest="command")
 
     # proofread
@@ -377,6 +400,15 @@ def main():
         help="检查类型 (默认 tgscc)",
     )
 
+    # max
+    m = sub.add_parser("max", aliases=["m"], help="最大化检查（全环节打通）")
+    m.add_argument("file", help="要检查的文件 (.md / .docx)")
+    m.add_argument("--model", default=DEFAULT_MODEL, choices=AVAILABLE_MODELS)
+    m.add_argument("--concurrent", type=int, default=3, help="LLM 并发数 (默认 3)")
+    m.add_argument("--rpm", type=int, default=15, help="API 速率限制 (默认 15)")
+    m.add_argument("--names", action="store_true", help="启用专名查词（MDict 词典）")
+    m.add_argument("--no-view", action="store_true", help="不自动打开报告")
+
     args = parser.parse_args()
 
     cmd_map = {
@@ -388,6 +420,8 @@ def main():
         "d": cmd_diff,
         "special": cmd_special,
         "s": cmd_special,
+        "max": cmd_max,
+        "m": cmd_max,
     }
     fn = cmd_map.get(args.command)
     if fn:

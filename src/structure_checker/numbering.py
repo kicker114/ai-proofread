@@ -23,7 +23,6 @@ def chinese_numeral_to_int(text: str) -> Optional[int]:
     total = 0
     section = 0
     number = 0
-    _last_unit = 1  # 保留变量名以便后续扩展（避免大改），当前未使用
 
     for ch in text:
         if ch in _CN_DIGITS:
@@ -31,16 +30,22 @@ def chinese_numeral_to_int(text: str) -> Optional[int]:
         elif ch in _CN_UNITS:
             unit = _CN_UNITS[ch]
             if unit >= 10000:
-                section = (section + (number if number else 1)) * unit
-                total += section
+                # 万/亿：将当前累积的 section + number 作为整体乘以单位。
+                # 原实现 `(section + (number if number else 1))` 在 "十亿" 时
+                # number=0（十已被消费进 section）却兜底成 1，导致 10亿+1亿=11亿。
+                # 正确语义：数字已消费则补 0，仅在完全没有前置数字时（如 "万一"）补 1。
+                section += number
+                if section == 0:
+                    section = 1
+                total += section * unit
                 section = 0
+                number = 0
             else:
                 # 十/百/千
                 if number == 0:
                     number = 1
                 section += number * unit
-            number = 0
-            _last_unit = unit
+                number = 0
         else:
             # 非法字符，放弃解析
             return None

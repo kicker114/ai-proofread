@@ -25,10 +25,14 @@ class TGSCCChecker:
         # 预编译正则表达式
         self.pinzi_pattern = re.compile(r'〖([^〗]+)〗(\d*)')
         self.variant_pattern = re.compile(r'(\D)(\d*)')
-        self.ignore_pattern = re.compile(r"""[0-9a-zA-Z，。！？；：“”‘’（）《》,.!?;:"'~\s\(\)\[\]]+""")
+        # 忽略的字符集合：ASCII 数字/字母、常见中英文标点与符号标记
+        self.ignore_pattern = re.compile(
+            r"""[0-9a-zA-Z，。！？；：“”‘’（）《》,.!?;:"'~\s\(\)\[\]]+"""
+        )
 
         # 初始化数据
         self.tgscc_list = []
+        self._tgscc_set = set()
         self.simplified_to_traditional = {}  # 简繁映射
         self.simplified_to_variants = {}    # 简异映射
         self.traditional_to_simplified = {} # 繁简映射
@@ -36,6 +40,8 @@ class TGSCCChecker:
         self.notes = {}  # 字 -> 注释正文（合并原 notes 编号与 notes_content）
 
         self._load_data()
+        # 构建 O(1) 查询集合（8105 字的 list 逐字符线性扫描太慢）
+        self._tgscc_set = set(self.tgscc_list)
 
     def _load_data(self):
         if not os.path.exists(self.tgscc_data_path):
@@ -163,6 +169,10 @@ class TGSCCChecker:
         for i, char in enumerate(text):
             if self.ignore_pattern.match(char) or char in ignore_list:
                 continue
+            # 非基本区 CJK 字符（标点、英文、数字、emoji、扩展区生僻字等）直接跳过，
+            # 不进入 TGSCC 检查 —— 这是消除标点/符号噪声的关键
+            if not ('一' <= char <= '鿿'):
+                continue
 
             is_in_tgscc_appendix = False
 
@@ -190,7 +200,7 @@ class TGSCCChecker:
                     confidence=1
                 ))
 
-            if not is_in_tgscc_appendix and char not in self.tgscc_list:
+            if not is_in_tgscc_appendix and char not in self._tgscc_set:
                 results.append(CheckResult(
                     error_type='not_general_standard_kanji',
                     location=(i, i + 1),

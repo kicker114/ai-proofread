@@ -28,16 +28,27 @@ def find_best_match(
         'ratio': 0
         }
 
+    if not fragment:
+        return best_match
+
     # 使用滑动窗口在原文中查找，窗口大小有±offset字符的弹性
     base_window_size = len(fragment)
-    for window_size in range(base_window_size - len_offset, base_window_size + len_offset):
-        if window_size <= 0:
+    # 最小窗口不小于 2 字符，避免单字符窗口产生误匹配
+    # （原实现允许窗口缩到 1 字符，导致 "啤洒" 匹配到 "啤" 而非整词）
+    min_window = max(2, base_window_size - len_offset)
+    for window_size in range(min_window, base_window_size + len_offset):
+        if window_size > len(text):
             continue
         for i in range(len(text) - window_size + 1):
             substring = text[i:i+window_size]
             ratio = fuzz.ratio(fragment, substring)
-
-            if ratio > best_match['ratio']:
+            # 同分时优先首字符相同的候选（防止 "啤洒" 匹配到 "说啤" 而非 "啤酒"）
+            if ratio > best_match['ratio'] or (
+                    ratio == best_match['ratio']
+                    and best_match['real_text'] is not None
+                    and fragment and substring
+                    and substring[0] == fragment[0]
+                    and best_match['real_text'][0] != fragment[0]):
                 best_match.update({
                     'real_text': substring,
                     'location': (i, i+window_size),
@@ -68,7 +79,11 @@ def find_best_match_list(
     """
     results = []
 
-    for fragment, modified in replacements:
+    for item in replacements:
+        if isinstance(item, tuple):
+            fragment, modified = item
+        else:
+            fragment, modified = item, None
         best_match = find_best_match(text, fragment, modified=modified)
         results.append(best_match)
 
@@ -89,15 +104,33 @@ def apply_replacements(text: str,
     """
     result_text = text
 
-    # 从后向前替换，避免位置变化影响后续替换
+    # 从后向前按 location 精确切片替换，避免 str.replace 的全局替换副作用
+    # （str.replace 会替换所有相同片段，而非仅目标位置）
     for info in sorted(replacement_info,
                       key=lambda x: x['location'][0] if x['location'] else -1,
                       reverse=True):
-        if info['real_text'] and info['location'] and info['ratio'] >= similarity_threshold:
-            if info['real_text'] in result_text:
-                result_text = result_text.replace(info['real_text'], info['modified_text'])
-            else:
+        if not (info['real_text'] and info['location']):
+            continue
+        if info['ratio'] < similarity_threshold:
+            continue
+        modified = info.get('modified_text')
+        if modified is None:
+            # 没有替换文本时，仅标记不修改
+            continue
+        start, end = info['location']
+        if start < 0 or end > len(result_text):
+            print(f"替换失败: 位置越界 '{info['real_text']}' @{info['location']}")
+            continue
+        # 校验切片内容与 real_text 一致（防止位置漂移）
+        actual = result_text[start:end]
+        if actual != info['real_text']:
+            # 位置因前面的替换发生了漂移：在剩余文本中查找 real_text 的最近位置
+            pos = result_text.find(info['real_text'])
+            if pos == -1:
                 print(f"替换失败: 未找到文本 '{info['real_text']}'")
+                continue
+            start, end = pos, pos + len(info['real_text'])
+        result_text = result_text[:start] + modified + result_text[end:]
 
     return result_text
 

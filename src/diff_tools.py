@@ -1,6 +1,7 @@
 """比较11.md和22.md的差异，并生成html文件"""
 
 import difflib
+import html
 import os
 
 from typing import List
@@ -126,20 +127,21 @@ def jsdiff_md_text(path, file_name_a, file_name_b, diff_path=None):
     if diff_path is None:
         diff_path = f'{path}/{".".join(file_name_b.split(".")[:-1])}_diff.html'
 
-    # 读取文件 TODO 转义
+    # 读取文件（HTML 转义：文本中含 </script>、<、>、& 等会破坏页面结构或注入）
     with open(f'{path}/{file_name_a}', 'r', encoding='utf-8') as f:
-        text1 = f.read()
+        text1 = html.escape(f.read())
 
     with open(f'{path}/{file_name_b}', 'r', encoding='utf-8') as f:
-        text2 = f.read()
+        text2 = html.escape(f.read())
 
     # jsdiff.html 模板（相对于模块自身路径）
     _RES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resource")
     _TEMPLATE_PATH = os.path.join(_RES_DIR, "jsdiff.html")
     with open(_TEMPLATE_PATH, 'r', encoding='utf-8') as f:
         content = f.read()
-        # 替换<title>Diff</title>中的名称
-        content = content.replace(r'<title>Diff</title>', f'<title>{file_name_a} vs {file_name_b}</title>')
+        # 替换<title>Diff</title>中的名称（文件名也需转义）
+        title_safe = html.escape(f'{file_name_a} vs {file_name_b}')
+        content = content.replace(r'<title>Diff</title>', f'<title>{title_safe}</title>')
         # 替换a-text
         content = content.replace(r'<script type="text/plain" id="a-text">这里是你的长文本内容a...可以包含多行</script>', f'<script type="text/plain" id="a-text">{text1}</script>')
         # 替换b-text

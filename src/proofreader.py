@@ -21,9 +21,22 @@ load_dotenv()
 # 读取提示文件（相对于模块自身路径，支持从任何 CWD 调用）
 _PROMPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resource")
 PROMPT_FILE_PATH = os.path.join(_PROMPT_DIR, "prompt-proofreader-system.xml")
+PROMPT_FILE_PATH_JSON = os.path.join(_PROMPT_DIR, "prompt-proofreader-system-outputJSON.xml")
 SYSTEM_PROMPT = ""
 with open(PROMPT_FILE_PATH, "r", encoding="utf-8") as file:
     SYSTEM_PROMPT = file.read()
+
+
+def load_system_prompt(mode: str = "rewrite") -> str:
+    """按模式加载系统提示词。
+
+    mode="rewrite"  全文重写模式（模型输出整个 target 的重写版）
+    mode="json"     JSON 发现模式（模型只输出 [{original_sentence, corrected_sentence}]）
+    """
+    if mode == "json":
+        with open(PROMPT_FILE_PATH_JSON, "r", encoding="utf-8") as file:
+            return file.read()
+    return SYSTEM_PROMPT
 
 class RateLimiter:
     """
@@ -44,7 +57,7 @@ class RateLimiter:
             self.last_call_time = time.time()
 
 
-def deepseek(content: str, reference: str="", model:str="deepseek-v4-flash") -> str|None:
+def deepseek(content: str, reference: str="", model:str="deepseek-v4-flash", system_prompt: str|None = None) -> str|None:
     """
     调用各家deepseek校对模型，返回校对后的文本
 
@@ -53,6 +66,7 @@ def deepseek(content: str, reference: str="", model:str="deepseek-v4-flash") -> 
            deepseek-chat (旧名，等价 v4-flash)
            deepseek-reasoner (旧名，等价 v4-flash thinking)
            deepseek-v3 (阿里云百炼)
+    system_prompt: 覆盖默认系统提示词（如 JSON 发现模式）
     """
 
     client: OpenAI|None = None
@@ -78,7 +92,8 @@ def deepseek(content: str, reference: str="", model:str="deepseek-v4-flash") -> 
     retry_count = 0
     result = ""
 
-    message= [{"role": "system", "content": SYSTEM_PROMPT}]
+    effective_system = system_prompt if system_prompt is not None else SYSTEM_PROMPT
+    message= [{"role": "system", "content": effective_system}]
     # 单独提交一轮reference可节省token但效果有待验证 TODO
     if reference:
         message.extend([{"role": "assistant", "content": ""},
