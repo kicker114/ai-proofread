@@ -55,6 +55,7 @@ ALIYPUN_API_KEY=          # 可选，阿里云百炼才需要
 proofread p  <file.md|docx>              # 单文件快速校对（全文重写）
 proofread b  <file.md|docx>              # 全书分块校对（带上下文，异步并发）
 proofread m  <file.md|docx>              # ★ 最大化检查（全环节打通）
+proofread w  <file.docx>                 # DOCX 修订+批注回写
 proofread d  <原稿.md> <校后.md>           # 生成 HTML 词级 diff
 proofread s  <file.md>                   # TGSCC 汉字规范专项检查
 ```
@@ -123,12 +124,49 @@ pandoc -f docx -t markdown-smart+pipe_tables+footnotes \
 
 ---
 
+## DOCX 修订+批注回写
+
+将审校发现回写到 Word 文档，生成带**字符级修订标记**和**格式化批注**的 `_审阅版.docx`。
+
+**引擎**：Adeu MCP `process_document_batch`（主力，遵循 [proofreading-publish/HANDOFF.md](/Users/kicker114/Developer/proofreading-publish/HANDOFF.md) 工具链定论）。
+
+### 用法
+
+```bash
+# 独立回写（已有 findings JSON）
+proofread w 稿件.docx --findings findings.json
+
+# 一键回写（审校 → 回写一条龙）
+proofread m 稿件.docx --writeback --author "审校助手"
+```
+
+### fix_class 路由
+
+| 发现类型 | fix_class | DOCX 行为 | 示例 |
+|----------|-----------|-----------|------|
+| TGSCC 繁体/异体（单字） | `polish` | **仅批注**，不改文（防误匹配） | "砦"→"寨" |
+| 异形词/不规范词形（多字） | `must_fix` | **字符级修订** + 聚焦批注 | "挺而走险"→"铤而走险" |
+| LLM 审校发现 | `polish` | 仅批注（建议复核） | 措辞/语法建议 |
+| 结构诊断 | （跳过） | 在 max report 呈现，不写回 DOCX | 章节编号断裂 |
+
+### 命令行参考
+
+```
+proofread w  <docx>  [--findings PATH] [--out PATH] [--author NAME] [--dry-run]
+proofread m  <docx>  --writeback [--author NAME]
+```
+
+`--findings` 不传时自动搜索同目录 `_max_results.json`。
+
+---
+
 ## 核心模块索引
 
 | 模块 | 路径 | 用途 |
 |------|------|------|
 | CLI 入口 | `src/cli.py` | `proofread` 命令定义 |
 | 最大化管线 | `src/max_pipeline.py` | max 模式编排 |
+| **DOCX 回写** | `src/writeback.py` | Adeu 引擎修订+批注（fix_class 路由） |
 | 校对引擎 | `src/proofreader.py` | DeepSeek/Google API 调用，异步并发+断点续跑 |
 | 文本切分 | `src/splitter.py` | 按标题/长度切分，带上下文，中文句子切分 |
 | 句子对齐 | `src/sentence_aligner.py` | 锚点算法 + Jaccard n-gram |
