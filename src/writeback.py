@@ -53,9 +53,9 @@ ROUTING = {
         "warn":    ("verify",   "💬待核【结构】"),
     },
     "1_llm": {
-        "warn":    ("polish",   "💬润色【AI审校】"),
+        "warn":    ("must_fix", "【必改·AI审校】"),
         "error":   ("must_fix", "【必改·AI审校】"),
-        "info":    ("verify",   "💬待核【AI审校】"),
+        "info":    ("polish",   "💬润色【AI审校】"),
     },
     "2_names": {
         "info":    ("verify",   "💬待核【专名】"),
@@ -155,7 +155,11 @@ def findings_to_adeu_changes(findings: List[Dict]) -> List[Dict]:
         if f.get("basis"):
             comment_lines.append(f"◎ 依据：{f['basis']}")
         if f.get("ratio"):
-            comment_lines.append(f"◎ 置信度：{f['ratio']:.0%}")
+            # ratio 是 0-100 的整数或 0-1 的浮点数
+            r = f['ratio']
+            if r > 1:
+                r = r / 100.0  # 标准化为 0-1
+            comment_lines.append(f"◎ 置信度：{r:.0%}")
 
         change: Dict[str, Any] = {
             "type": "modify",

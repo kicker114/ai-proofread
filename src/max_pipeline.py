@@ -74,8 +74,20 @@ def _json_extract(text: str) -> Optional[List[Dict]]:
     return None
 
 
+def _save_findings(path: str, results: Dict[str, Any]) -> None:
+    """将 max pipeline 各阶段发现序列化到 JSON，供 writeback 使用。"""
+    export = {}
+    for key in ("tgscc", "variants", "structure", "llm", "names"):
+        data = results.get(key, [])
+        if isinstance(data, list) and data:
+            export[key] = data
+    if export:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(export, f, ensure_ascii=False, indent=2)
+        print(f"  发现 JSON: {path}")
+
+
 def _load_offline_data() -> Dict[str, Any]:
-    """加载离线确定性数据（异形词/推荐词形/人名年号）。"""
     data: Dict[str, Any] = {"variant_to_standard": {}, "variant_to_preferred": {}}
     # xh7_compressed.json（现汉第7版 压缩版）
     xh7_path = _DATA_DIR / "xh7_compressed.json"
@@ -517,6 +529,11 @@ def run_max(
         f.write(refined_text)
     print(f"  精修版: {refined_path}")
     results["refined_path"] = refined_path
+
+    # 保存完整发现 JSON（供 writeback 使用）
+    findings_path = os.path.join(out_dir, f"{docname}_max_results.json")
+    _save_findings(findings_path, results)
+    results["findings_path"] = findings_path
 
     # ── Phase 2: 专名查词（可选） ──
     names = []
