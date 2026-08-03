@@ -5,6 +5,8 @@ ai-proofread CLI — 终端直接调用审校管线，无需 VSCode。
 pip install -e . 后全局可用:
     proofread p <file.md|file.docx>             # 单文件校对 (自动转 .docx → .md)
     proofread b <file.md|file.docx>             # 全书分块校对
+    proofread m <file.md|file.docx>             # ★ 最大化检查（全环节）
+    proofread w <file.docx>                     # DOCX 修订+批注回写
     proofread d <原稿.md> <校后.md>               # 生成 HTML diff
     proofread s <file.md>                       # 汉字规范专项检查
 
@@ -12,18 +14,20 @@ pip install -e . 后全局可用:
 
 输出:
     <stem>.proofread.md              校对后文件
-    <stem>.proofread.json.md         全书校对后文件（book 模式）
-    <stem>_diff.html                 浏览器可打开的 HTML 词级 diff
+    <stem>_refined.md                精修版全文（max 模式）
+    <stem>_max_report.html           综合报告（max 模式）
+    <stem>_alignment.html            句子级对齐勘误表（max 模式）
+    <stem>_审阅版.docx               DOCX 修订+批注回写版
 """
 
 import argparse
 import asyncio
 import json
 import os
-import re
 import sys
 import webbrowser
 from pathlib import Path
+from typing import Optional
 from dotenv import load_dotenv
 
 # 加载环境变量（src/.env 中的 DEEPSEEK_API_KEY）
@@ -330,6 +334,113 @@ def cmd_max(args):
         webbrowser.open(url)
         print(f"🌐 报告已打开: {url}")
 
+    # 可选回写
+    if args.writeback:
+        docx_path = _find_source_docx(args.file)
+        if docx_path:
+            _do_writeback(docx_path, results, args.author)
+
+
+# ── 子命令: DOCX 回写 ─────────────────────────────────────────────────
+
+
+def _find_source_docx(file_arg: str) -> Optional[str]:
+    """根据输入参数（.docx 或已转换的 .md）找到源 docx 路径。"""
+    fpath = Path(file_arg)
+    if fpath.suffix.lower() == ".docx" and fpath.exists():
+        return str(fpath)
+    # 尝试同目录下同名 .docx
+    stem = fpath.parent / fpath.stem
+    for ext in (".docx", ".doc"):
+        candidate = stem.parent / f"{stem.name}{ext}"
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def _do_writeback(docx_path: str, findings_data: dict, author: str = "审校助手"):
+    """执行 DOCX 回写：生成 Adeu 命令文件。"""
+    from .writeback import load_findings, findings_to_adeu_changes, _write_adeu_batch_script
+
+    # 收集所有阶段的发现
+    all_findings = []
+    for key in ("tgscc", "variants", "structure", "llm", "names", "findings"):
+        batch = findings_data.get(key, [])
+        if isinstance(batch, list):
+            all_findings.extend(batch)
+    # 也接受直接的 issues[] 格式
+    if isinstance(findings_data, list):
+        all_findings = findings_data
+
+    if not all_findings:
+        print("⚠️  没有可回写的发现")
+        return
+
+    print(f"\n📋 回写 {len(all_findings)} 条发现...")
+    changes = findings_to_adeu_changes(all_findings)
+
+    output_path = str(Path(docx_path).parent / f"{Path(docx_path).stem}_审阅版.docx")
+    script_path = _write_adeu_batch_script(docx_path, output_path, changes, author)
+
+    print(f"📄 Adeu 批处理命令: {script_path}")
+    print(f"📄 目标输出: {output_path}")
+    print(f"💡 下一步: proofread w --apply 应用修订到 DOCX")
+
+
+def cmd_writeback(args):
+    """DOCX 修订+批注回写。"""
+    from .writeback import load_findings, writeback_adeu
+
+    # 查找源 docx
+    docx_path = args.docx if Path(args.docx).exists() else _find_source_docx(args.docx)
+    if not docx_path:
+        print(f"❌ 找不到源文档: {args.docx}")
+        sys.exit(1)
+
+    # 自动推断 findings
+    findings_path = args.findings
+    if findings_path is None:
+        d = Path(docx_path).parent
+        stem = Path(docx_path).stem
+        candidates = [
+            str(d / f"{stem}_max_results.json"),
+            str(d / f"{stem}_findings.json"),
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                findings_path = c
+                break
+        if findings_path is None:
+            print("❌ 未指定 --findings，自动搜索也找不到")
+            sys.exit(1)
+
+    findings = load_findings(findings_path)
+    print(f"📥 加载 {len(findings)} 条发现")
+
+    if not findings:
+        print("❌ 没有发现数据")
+        sys.exit(1)
+
+    if args.apply:
+        _apply_adeu_writeback(findings_path)
+    else:
+        changes = writeback_adeu(docx_path, findings, output_path=args.out, author=args.author)
+        print(f"\n✅ 回写命令已生成，执行 proofread w --apply 应用修订")
+
+
+def _apply_adeu_writeback(commands_path: str):
+    """读取 Adeu 命令文件并执行 MCP process_document_batch（需在 agent 上下文中）。"""
+    with open(commands_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    print(f"📋 准备执行 Adeu 批处理 ({len(payload['changes'])} 条变更)...")
+    print(f"   源文档: {payload['source_docx']}")
+    print(f"   输出: {payload['output_path']}")
+    print()
+    print("💡 Adeu MCP 调用需在 Claude Code agent 上下文中完成。")
+    print("   请将以下命令文件交给 Claude Code agent:")
+    print(f"   cat {commands_path} | proofread w --apply")
+    # 实际执行需 mcp__adeu__process_document_batch 工具（仅在 agent 中可用）
+
 
 # ── 主入口 ─────────────────────────────────────────────────────────────
 
@@ -340,14 +451,14 @@ def main():
         description="ai-proofread 命令行工具 — 终端直接调用审校，无需 VSCode",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
-子命令简写:  p=proofread  b=book  m=max  d=diff  s=special
+子命令简写:  p=proofread  b=book  m=max  w=writeback  d=diff  s=special
 
 示例:
   proofread p 我的稿件.docx
-  proofread p 我的稿件.md --context 上下文.md --ref 参考资料.md
   proofread b 我的稿件.docx --concurrent 5
   proofread m 我的稿件.docx              # ★ 最大化检查（全环节）
-  proofread m 我的稿件.docx --names      # 含专名查词
+  proofread m 我的稿件.docx --writeback  #   审校后自动回写 DOCX
+  proofread w 我的稿件.docx              #   独立回写修订+批注
   proofread d 原稿.md 校后.md
   proofread s 我的稿件.md
 
@@ -407,7 +518,20 @@ def main():
     m.add_argument("--concurrent", type=int, default=3, help="LLM 并发数 (默认 3)")
     m.add_argument("--rpm", type=int, default=15, help="API 速率限制 (默认 15)")
     m.add_argument("--names", action="store_true", help="启用专名查词（MDict 词典）")
+    m.add_argument("--writeback", action="store_true",
+                    help="审校完成后自动回写 DOCX（修订+批注）")
+    m.add_argument("--author", default="审校助手", help="修订作者名")
     m.add_argument("--no-view", action="store_true", help="不自动打开报告")
+
+    # writeback
+    w = sub.add_parser("writeback", aliases=["w"], help="DOCX 修订+批注回写")
+    w.add_argument("docx", help="原始 Word 文档 (.docx)")
+    w.add_argument("--findings", help="发现 JSON（自动搜索同目录 _max_results.json）")
+    w.add_argument("--out", help="输出路径（默认 <stem>_审阅版.docx）")
+    w.add_argument("--author", default="审校助手", help="修订作者名")
+    w.add_argument("--apply", action="store_true",
+                    help="实际执行 Adeu MCP 回写（需 Claude Code agent）")
+    w.add_argument("--dry-run", action="store_true", help="仅导出命令，不执行")
 
     args = parser.parse_args()
 
@@ -422,6 +546,8 @@ def main():
         "s": cmd_special,
         "max": cmd_max,
         "m": cmd_max,
+        "writeback": cmd_writeback,
+        "w": cmd_writeback,
     }
     fn = cmd_map.get(args.command)
     if fn:
