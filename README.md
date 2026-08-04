@@ -128,7 +128,9 @@ pandoc -f docx -t markdown-smart+pipe_tables+footnotes \
 
 将审校发现回写到 Word 文档，生成带**字符级修订标记**和**格式化批注**的 `_审阅版.docx`。
 
-**引擎**：Adeu MCP `process_document_batch`（主力，遵循 [proofreading-publish/HANDOFF.md](/Users/kicker114/Developer/proofreading-publish/HANDOFF.md) 工具链定论）。
+**引擎**：**02 引擎（直接 OOXML，默认）**——纯 lxml+zipfile 操作 `word/document.xml`，
+按 P 编号定位段落，用 `difflib` 做字符级最小 diff，直接插入 `<w:del>/<w:ins>` 修订
+和 `<w:comment>` 批注。零中间文本转换损耗，保留既有修订。
 
 ### 用法
 
@@ -138,6 +140,23 @@ proofread w 稿件.docx --findings findings.json
 
 # 一键回写（审校 → 回写一条龙）
 proofread m 稿件.docx --writeback --author "审校助手"
+
+# 旧方案（Adeu MCP，需 agent 上下文）
+proofread w 稿件.docx --engine adeu
+```
+
+### P 编号贯穿（正本清源）
+
+回写可靠性取决于 finding 能否定位到 DOCX 的 P 段落：
+
+```
+DOCX → _build_para_text_map() → {P0: 文本, P1: 文本, ...}   # 02 引擎规则，含表格
+  ↓
+LLM 发现 → _resolve_findings_to_p() → 每条定位到 P 段落
+  ↓         （精确子串 → fuzzy → LCS 最长公共子串）
+issues[] → 02 引擎 → 按 P 编号在 DOCX 里精确定位段落
+  ↓
+字符级最小 diff → <w:del>/<w:ins> + <w:comment>
 ```
 
 ### fix_class 路由
@@ -146,13 +165,14 @@ proofread m 稿件.docx --writeback --author "审校助手"
 |----------|-----------|-----------|------|
 | TGSCC 繁体/异体（单字） | `polish` | **仅批注**，不改文（防误匹配） | "砦"→"寨" |
 | 异形词/不规范词形（多字） | `must_fix` | **字符级修订** + 聚焦批注 | "挺而走险"→"铤而走险" |
-| LLM 审校发现 | `polish` | 仅批注（建议复核） | 措辞/语法建议 |
+| LLM 审校发现（有实质修改） | `must_fix` | **字符级修订** + 批注 | "习近平"→"习近平同志" |
+| LLM 审校发现（仅提示） | `verify` | 批注不改文 | 待核实项 |
 | 结构诊断 | （跳过） | 在 max report 呈现，不写回 DOCX | 章节编号断裂 |
 
 ### 命令行参考
 
 ```
-proofread w  <docx>  [--findings PATH] [--out PATH] [--author NAME] [--dry-run]
+proofread w  <docx>  [--findings PATH] [--out PATH] [--author NAME] [--engine 02|adeu]
 proofread m  <docx>  --writeback [--author NAME]
 ```
 
@@ -166,7 +186,8 @@ proofread m  <docx>  --writeback [--author NAME]
 |------|------|------|
 | CLI 入口 | `src/cli.py` | `proofread` 命令定义 |
 | 最大化管线 | `src/max_pipeline.py` | max 模式编排 |
-| **DOCX 回写** | `src/writeback.py` | Adeu 引擎修订+批注（fix_class 路由） |
+| **DOCX 回写引擎** | `src/writeback_engine.py` | 02 引擎：直接 OOXML 字符级修订+批注 |
+| **回写适配** | `src/writeback.py` | Adeu MCP 旧方案（`--engine adeu`） |
 | 校对引擎 | `src/proofreader.py` | DeepSeek/Google API 调用，异步并发+断点续跑 |
 | 文本切分 | `src/splitter.py` | 按标题/长度切分，带上下文，中文句子切分 |
 | 句子对齐 | `src/sentence_aligner.py` | 锚点算法 + Jaccard n-gram |
