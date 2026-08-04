@@ -321,24 +321,19 @@ def cmd_special(args):
 
 
 def cmd_max(args):
-    """最大化检查：确定性检查 + LLM 审校 + 句子对齐 + 综合报告。"""
+    """最大化检查：确定性检查 + LLM 审校 + 句子对齐 + 综合报告 + 可选 DOCX 回写。"""
     from .max_pipeline import run_max
 
     results = run_max(
         args.file, model=args.model, concurrent=args.concurrent,
-        rpm=args.rpm, run_names=args.names, verbose=args.verbose)
+        rpm=args.rpm, run_names=args.names, verbose=args.verbose,
+        writeback=args.writeback, author=args.author)
 
     # 自动打开 master 报告
     if not args.no_view and results.get("report_path"):
         url = f"file://{Path(results['report_path']).resolve()}"
         webbrowser.open(url)
         print(f"🌐 报告已打开: {url}")
-
-    # 可选回写
-    if args.writeback:
-        docx_path = _find_source_docx(args.file)
-        if docx_path:
-            _do_writeback(docx_path, results, args.author)
 
 
 # ── 子命令: DOCX 回写 ─────────────────────────────────────────────────
@@ -388,9 +383,11 @@ def _do_writeback(docx_path: str, findings_data: dict, author: str = "审校助�
 
 
 def cmd_writeback(args):
-    """DOCX 修订+批注回写。"""
-    from .writeback import load_findings, writeback_adeu
+    """DOCX 修订+批注回写。
 
+    默认引擎：02（直接 OOXML，字符级修订，保留既有修订）。
+    --engine adeu 保留旧 Adeu MCP 方案。
+    """
     # 查找源 docx
     docx_path = args.docx if Path(args.docx).exists() else _find_source_docx(args.docx)
     if not docx_path:
@@ -414,18 +411,51 @@ def cmd_writeback(args):
             print("❌ 未指定 --findings，自动搜索也找不到")
             sys.exit(1)
 
-    findings = load_findings(findings_path)
+    if args.engine == "adeu":
+        # 旧方案：Adeu MCP（保留）
+        from .writeback import load_findings, writeback_adeu
+        findings = load_findings(findings_path)
+        print(f"📥 加载 {len(findings)} 条发现")
+        if not findings:
+            print("❌ 没有发现数据")
+            sys.exit(1)
+        writeback_adeu(docx_path, findings, output_path=args.out, author=args.author)
+        print(f"\n✅ Adeu 回写命令已生成，执行 proofread w --apply 应用修订")
+        return
+
+    # 02 引擎（默认）：直接 OOXML 字符级修订 + 批注
+    from .max_pipeline import (
+        _build_para_text_map, _resolve_findings_to_p,
+        _findings_to_issues, _run_02_writeback,
+    )
+
+    with open(findings_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    # 兼容 max_results.json（按 phase 分组）和 issues[] 列表
+    findings = []
+    if isinstance(data, list):
+        findings = data
+    elif isinstance(data, dict):
+        for key in ("tgscc", "variants", "structure", "llm", "names"):
+            batch = data.get(key, [])
+            if isinstance(batch, list):
+                findings.extend(batch)
+        if not findings and isinstance(data.get("issues"), list):
+            # 已经是 issues[]，直接走 02 引擎
+            review = _run_02_writeback(
+                docx_path, Path(docx_path).stem, data["issues"], args.author)
+            print(f"✅ 审阅版: {review}")
+            return
+
     print(f"📥 加载 {len(findings)} 条发现")
 
-    if not findings:
-        print("❌ 没有发现数据")
-        sys.exit(1)
-
-    if args.apply:
-        _apply_adeu_writeback(findings_path)
-    else:
-        changes = writeback_adeu(docx_path, findings, output_path=args.out, author=args.author)
-        print(f"\n✅ 回写命令已生成，执行 proofread w --apply 应用修订")
+    # P 编号定位 → issues[] → 02 引擎回写
+    text_map = _build_para_text_map(docx_path)
+    resolved = _resolve_findings_to_p(findings, text_map)
+    issues = _findings_to_issues(resolved)
+    review = _run_02_writeback(docx_path, Path(docx_path).stem, issues, args.author)
+    print(f"✅ 审阅版: {review}")
 
 
 def _apply_adeu_writeback(commands_path: str):
@@ -529,8 +559,10 @@ def main():
     w.add_argument("--findings", help="发现 JSON（自动搜索同目录 _max_results.json）")
     w.add_argument("--out", help="输出路径（默认 <stem>_审阅版.docx）")
     w.add_argument("--author", default="审校助手", help="修订作者名")
+    w.add_argument("--engine", default="02", choices=["02", "adeu"],
+                    help="回写引擎：02（默认，直接 OOXML）| adeu（MCP，旧方案）")
     w.add_argument("--apply", action="store_true",
-                    help="实际执行 Adeu MCP 回写（需 Claude Code agent）")
+                    help="（仅 adeu 引擎）实际执行 MCP 回写")
     w.add_argument("--dry-run", action="store_true", help="仅导出命令，不执行")
 
     args = parser.parse_args()

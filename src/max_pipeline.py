@@ -87,6 +87,210 @@ def _save_findings(path: str, results: Dict[str, Any]) -> None:
         print(f"  发现 JSON: {path}")
 
 
+# ── P 编号文本池（与 writeback_engine.build_para_map 逐字节一致）──────
+
+_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+
+def _para_raw_text(p_elem) -> str:
+    """Accept-view text of a w:p —— 含 w:ins 内文本，排除 w:del 祖先下文本。
+
+    必须与 apply_corrections_02.build_para_map 的 _para_raw_text 逐字节一致，
+    否则 findings 的 location:P{n} 在回写时会定位错位。
+    """
+    parts = []
+    for t in p_elem.iter(f"{{{_W_NS}}}t"):
+        if any(a.tag == f"{{{_W_NS}}}del" for a in t.iterancestors()):
+            continue
+        parts.append(t.text or "")
+    return "".join(parts)
+
+
+def _build_para_text_map(docx_path: str) -> Dict[int, str]:
+    """按 02 引擎规则构建 {pn: text} 文本池。
+
+    规则（与 writeback_engine.build_para_map 一致）：
+      - body 直接子级 w:p：非空文本 → pn 从 0 递增
+      - w:tbl 内每个单元格段落（.//w:p）→ 同样编号（一个单元格段落 = 一个 P）
+      - 空段落跳过（不占 P 编号）
+    """
+    import zipfile
+    from lxml import etree
+
+    with zipfile.ZipFile(docx_path, "r") as z:
+        doc_xml = etree.fromstring(z.read("word/document.xml"))
+    body = doc_xml.find(f"{{{_W_NS}}}body")
+    text_map: Dict[int, str] = {}
+    pn = 0
+    if body is None:
+        return text_map
+    for child in body.iterchildren():
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag == "p":
+            t = _para_raw_text(child)
+            if t.strip():
+                text_map[pn] = t
+                pn += 1
+        elif tag == "tbl":
+            for row_p in child.findall(f".//{{{_W_NS}}}p"):
+                t = _para_raw_text(row_p)
+                if t.strip():
+                    text_map[pn] = t
+                    pn += 1
+    return text_map
+
+
+def _find_source_docx(file_arg: str) -> Optional[str]:
+    """根据输入参数（.docx 或已转换的 .md）找到源 docx 路径。"""
+    fpath = Path(file_arg)
+    if fpath.suffix.lower() == ".docx" and fpath.exists():
+        return str(fpath)
+    stem = fpath.parent / fpath.stem
+    for ext in (".docx", ".doc"):
+        candidate = stem.parent / f"{stem.name}{ext}"
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def _resolve_findings_to_p(findings: List[Dict], text_map: Dict[int, str]) -> List[Dict]:
+    """把 finding 定位到具体 P 段落，补充 pn/current/location。
+
+    策略：
+      1. 先在每段做精确子串匹配（real_text/current/original/char 命中即锁定，ratio=100）
+      2. 未命中 → find_best_match 模糊定位（每段取最高 ratio）
+      3. 均未命中 → 保留原 location（不强制 P）
+    """
+    from .special_checker.match_similar_text import find_best_match
+
+    items = sorted(text_map.items())  # [(pn, text)]
+    if not items:
+        return findings
+
+    resolved: List[Dict] = []
+    for f in findings:
+        key_text = (f.get("real_text") or f.get("current")
+                    or f.get("original") or f.get("char") or "").strip()
+        # 去除 markdown 标记残留（LLM 审校的是 MD，标题行可能带 # 前缀；
+        # DOCX 段落文本无此标记，导致定位失败）
+        key_text = re.sub(r"^#{1,6}\s*", "", key_text).strip()
+        key_text = re.sub(r"^\s*[-*]\s+", "", key_text).strip()
+        if not key_text:
+            f.setdefault("location", f"P{items[0][0]}")
+            resolved.append(f)
+            continue
+
+        # 1. 精确子串
+        best = None
+        for pn, ptext in items:
+            if key_text in ptext:
+                best = {"pn": pn, "real_text": key_text, "ratio": 100.0}
+                break
+        # 2. 模糊定位（只在精确未命中时）—— current 优先取段落内
+        #    与 key_text 最长公共前缀/后缀的精确子串，避免模糊片段
+        if best is None and len(key_text) >= 2:
+            for pn, ptext in items:
+                bm = find_best_match(ptext, key_text)
+                if bm.get("real_text") and bm.get("ratio", 0) >= 60:
+                    # 在段落里找 key_text 的最长精确子串
+                    exact = _longest_common_substring(key_text, ptext)
+                    anchor = exact if exact and len(exact) >= 2 else bm["real_text"]
+                    if best is None or bm["ratio"] > best["ratio"]:
+                        best = {"pn": pn, "real_text": anchor, "ratio": bm["ratio"]}
+
+        if best:
+            f["pn"] = best["pn"]
+            f["current"] = best["real_text"]
+            f["location"] = f"P{best['pn']}"
+            f["p_ratio"] = best["ratio"]
+        else:
+            f.setdefault("location", f"P{items[0][0]}")
+        resolved.append(f)
+    return resolved
+
+
+def _longest_common_substring(a: str, b: str) -> str:
+    """返回 a 与 b 的最长公共子串（简单实现，用于提取精确锚点）。"""
+    if not a or not b:
+        return ""
+    max_len = 0
+    best = ""
+    # 简化：以 a 的每个起点尝试 b.find 扩展（a 通常较短）
+    for start in range(len(a)):
+        lo, hi = start, len(a)
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if a[start:mid + 1] in b:
+                if mid - start + 1 > max_len:
+                    max_len = mid - start + 1
+                    best = a[start:mid + 1]
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        if len(a) - start <= max_len:
+            break
+    return best
+
+
+def _findings_to_issues(findings: List[Dict]) -> List[Dict]:
+    """把 max pipeline 各阶段发现转成 writeback_engine 的 issues[] 格式。
+
+    fix_class 路由：
+      - TGSCC 单字（tgscc）→ polish（批注不改文，防同字误匹配）
+      - 异形词/词形（variants）→ must_fix（字符级修订）
+      - LLM 有实质修改 → must_fix；无修改 → verify
+      - 结构诊断（structure）→ 跳过（在 HTML 报告呈现）
+    """
+    issues: List[Dict] = []
+    for f in findings:
+        phase = f.get("phase", "")
+        current = (f.get("current") or f.get("char") or f.get("original") or "").strip()
+        # 兼容 suggestion / suggested 两个字段名（max 用 suggestion，pub 用 suggested）
+        suggested = (f.get("suggested") or f.get("suggestion") or "").strip()
+        location = f.get("location") or f"P{f.get('pn', 0)}"
+        reason = (f.get("reason") or f.get("original") or f.get("message") or "").strip()
+
+        if phase.startswith("0c_structure"):
+            continue  # 结构诊断在 max report 呈现，不写回 DOCX
+
+        if phase.startswith("0a_tgscc"):
+            # 单字：剥离注释只取替换字
+            import re as _re
+            m = _re.match(r"^(\S+)\((.+)\)$", suggested)
+            sug = m.group(1) if m else suggested
+            issues.append({
+                "fix_class": "polish", "location": location,
+                "current": current, "suggested": sug,
+                "reason": suggested, "category": "tgscc汉字",
+            })
+        elif phase.startswith("0b_variant"):
+            issues.append({
+                "fix_class": "must_fix", "location": location,
+                "current": current, "suggested": suggested,
+                "reason": reason or "异形词规范", "category": "词形规范",
+            })
+        elif phase.startswith("1_llm") or phase.startswith("2_names"):
+            if suggested and suggested != current:
+                issues.append({
+                    "fix_class": "must_fix", "location": location,
+                    "current": current, "suggested": suggested,
+                    "reason": reason, "category": "ai审校",
+                })
+            else:
+                issues.append({
+                    "fix_class": "verify", "location": location,
+                    "current": current, "suggested": "",
+                    "reason": reason, "category": "ai审校",
+                })
+        else:
+            issues.append({
+                "fix_class": "polish", "location": location,
+                "current": current, "suggested": suggested,
+                "reason": reason, "category": "审校",
+            })
+    return issues
+
+
 def _load_offline_data() -> Dict[str, Any]:
     data: Dict[str, Any] = {"variant_to_standard": {}, "variant_to_preferred": {}}
     # xh7_compressed.json（现汉第7版 压缩版）
@@ -263,6 +467,7 @@ async def phase1_json_proofread(
                     "type": "correction",
                     "original": original,
                     "suggestion": corrected,
+                    "real_text": bm["real_text"],  # 实际匹配到的原文（供 P 映射）
                     "location": [start, end],
                     "ratio": bm["ratio"],
                     "severity": "warn",
@@ -468,8 +673,12 @@ a:hover {{ text-decoration:underline; }}
 def run_max(
         file_path: str, model: str = "deepseek-v4-flash",
         concurrent: int = 3, rpm: int = 15,
-        run_names: bool = False, verbose: bool = False) -> Dict:
-    """执行完整 max 管线。返回各阶段结果与产物路径。"""
+        run_names: bool = False, verbose: bool = False,
+        writeback: bool = False, author: str = "审校助手") -> Dict:
+    """执行完整 max 管线。返回各阶段结果与产物路径。
+
+    writeback=True 时，审校完成后直接把发现回写到 DOCX（02 引擎，字符级修订+批注）。
+    """
     from .cli import _resolve_input  # 复用 DOCX→MD 转换
     from .splitter import split_markdown_by_title_and_length_with_context
 
@@ -477,6 +686,13 @@ def run_max(
     md_path = _resolve_input(fpath)
     with open(md_path, "r", encoding="utf-8") as f:
         text = f.read()
+
+    # 源 docx 路径（用于 P 编号映射和回写）
+    src_docx = _find_source_docx(file_path)
+    text_map: Dict[int, str] = {}
+    if src_docx:
+        text_map = _build_para_text_map(src_docx)
+        print(f"源 DOCX: {Path(src_docx).name} ({len(text_map)} 段)")
 
     out_dir = str(md_path.parent)
     docname = md_path.stem
@@ -560,8 +776,62 @@ def run_max(
     results["report_path"] = report_path
     print(f"  ✓ 报告: {report_path}")
 
+    # ── Phase 5: DOCX 回写（02 引擎，直接 OOXML） ──
+    if writeback and src_docx:
+        print("\n[Phase 5] DOCX 回写（02 引擎，直接 OOXML）...")
+        all_findings = llm + tgscc + variants + structure
+        resolved = _resolve_findings_to_p(all_findings, text_map)
+        issues = _findings_to_issues(resolved)
+        n_must = sum(1 for i in issues if i["fix_class"] == "must_fix")
+        n_polish = sum(1 for i in issues if i["fix_class"] == "polish")
+        n_verify = sum(1 for i in issues if i["fix_class"] == "verify")
+        print(f"  ✓ 定位 {len(resolved)} 条发现 → {len(issues)} 条 issues"
+              f"（必改 {n_must} + 润色 {n_polish} + 待核 {n_verify}）")
+
+        review_path = _run_02_writeback(src_docx, docname, issues, author)
+        results["review_path"] = review_path
+        print(f"  ✓ 审阅版: {review_path}")
+
     print("\n✅ 最大化检查完成")
     return results
+
+
+def _run_02_writeback(src_docx: str, docname: str,
+                      issues: List[Dict], author: str) -> str:
+    """调用 02 引擎把 issues[] 回写到 DOCX。
+
+    建 output_<docname>/results/ 目录结构（02 引擎约定），subprocess 调用
+    writeback_engine.py，输出 <docname>_审阅版.docx。
+    """
+    import subprocess
+    from .writeback_engine import __file__ as ENGINE_PATH
+
+    # 02 引擎的 output_dir 约定：父目录需存在源 docx（stem 匹配）
+    parent = os.path.dirname(src_docx)
+    out_dir = os.path.join(parent, f"output_{docname}")
+    results_dir = os.path.join(out_dir, "results")
+    os.makedirs(results_dir, exist_ok=True)
+
+    # 写 issues[]（02 引擎 load_findings 读 results/*.json 的 issues 键）
+    issues_path = os.path.join(results_dir, "max_findings.json")
+    with open(issues_path, "w", encoding="utf-8") as f:
+        json.dump({"issues": issues}, f, ensure_ascii=False, indent=2)
+
+    # 输出路径（显式指定，避免 02 引擎默认路径歧义）
+    out_docx = os.path.join(out_dir, f"{docname}_审阅版.docx")
+
+    cmd = [sys.executable, ENGINE_PATH, out_dir,
+           "--author", author, "--out", out_docx]
+    print(f"  ⚙️  02 引擎: {' '.join(os.path.basename(c) if i in (0, 1) else c for i, c in enumerate(cmd))}")
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.stdout:
+        print(proc.stdout)
+    if proc.stderr:
+        print(proc.stderr, file=sys.stderr)
+    if proc.returncode != 0:
+        print(f"  ❌ 02 引擎退出码 {proc.returncode}", file=sys.stderr)
+        return out_docx
+    return out_docx
 
 
 if __name__ == "__main__":
@@ -572,7 +842,10 @@ if __name__ == "__main__":
     ap.add_argument("--concurrent", type=int, default=3)
     ap.add_argument("--rpm", type=int, default=15)
     ap.add_argument("--names", action="store_true", help="启用专名查词")
+    ap.add_argument("--writeback", action="store_true", help="审校后回写 DOCX")
+    ap.add_argument("--author", default="审校助手")
     ap.add_argument("--verbose", "-v", action="store_true")
     args = ap.parse_args()
     run_max(args.file, model=args.model, concurrent=args.concurrent,
-            rpm=args.rpm, run_names=args.names, verbose=args.verbose)
+            rpm=args.rpm, run_names=args.names, verbose=args.verbose,
+            writeback=args.writeback, author=args.author)
