@@ -113,7 +113,7 @@ proofread s  <file.md>                   # TGSCC 汉字规范专项检查
 
 没有标题时程序随机选择切分位置；段间没有空行可能导致切分过长、效果变差。
 
-**PDF**：建议先转成 HTML/docx 再整理成 Markdown（见下文 pandoc）。
+**PDF**：原生支持。`src/pdf_pipeline.py pdf2md` 直接转 Markdown + 审校后 PyMuPDF 高亮批注回写（见下方「PDF 审校工具链」）。
 
 ```bash
 # docx → markdown（保留脚注、表格）
@@ -180,6 +180,43 @@ proofread m  <docx>  --writeback [--author NAME]
 
 ---
 
+## PDF 审校工具链
+
+`src/pdf_pipeline.py` 提供完整的 PDF 审校链路，无需手动 pandoc 转换：
+
+```bash
+# 1. PDF → Markdown（pymupdf4llm，提取文本层）
+python3 src/pdf_pipeline.py pdf2md book.pdf --out book.md
+
+# 2. 走 max 管线审校
+proofread m book.md --no-view
+
+# 3. dry-run 预览批注命中率
+python3 src/pdf_pipeline.py annotate book.pdf book_max_results.json --dry-run --csv preview.csv
+
+# 4. 正式回写 PDF 高亮批注
+python3 src/pdf_pipeline.py annotate book.pdf book_max_results.json --author "AI审校"
+# → book_审阅版.pdf + book_批注清单.csv
+```
+
+### annotate 三层定位策略
+
+PyMuPDF 的 `page.search_for()` 无法跨行匹配。本工具采用三层回退：
+
+| 层级 | 策略 | 说明 |
+|------|------|------|
+| `exact` | 字符级全文本索引 | `get_text("dict")` 逐行 bbox，跨行/跨页连续文本一次高亮 |
+| `fragment` | 最长纯片段回退 | 当句子被页眉页脚打断时，命中页内最长片段 |
+| `fuzzy` | rapidfuzz 滑动窗口 | len≥4, score≥85，标记「待复核」 |
+
+每条的匹配方法和页码记录在 `_批注清单.csv` 中。批注颜色按 fix_class 区分：`must_fix`=amber，`polish`=浅黄，`verify`=浅蓝，`tgscc`=浅红。
+
+### WorkBuddy 入口
+
+项目附带 WorkBuddy Agent 定义（`.workbuddy/agents/pdf-proofreader.md`），WorkBuddy 可直接驱动上述全流程。
+
+---
+
 ## 核心模块索引
 
 | 模块 | 路径 | 用途 |
@@ -188,6 +225,7 @@ proofread m  <docx>  --writeback [--author NAME]
 | 最大化管线 | `src/max_pipeline.py` | max 模式编排 |
 | **DOCX 回写引擎** | `src/writeback_engine.py` | 02 引擎：直接 OOXML 字符级修订+批注 |
 | **回写适配** | `src/writeback.py` | Adeu MCP 旧方案（`--engine adeu`） |
+| **PDF 工具链** | `src/pdf_pipeline.py` | PDF→MD 转换 + PyMuPDF 高亮批注回写 |
 | 校对引擎 | `src/proofreader.py` | DeepSeek/Google API 调用，异步并发+断点续跑 |
 | 文本切分 | `src/splitter.py` | 按标题/长度切分，带上下文，中文句子切分 |
 | 句子对齐 | `src/sentence_aligner.py` | 锚点算法 + Jaccard n-gram |
