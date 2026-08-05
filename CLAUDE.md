@@ -45,26 +45,41 @@ back as **highlight annotations on the original PDF**:
 
 - Agent definition: `.workbuddy/agents/pdf-proofreader.md` (name `pdf-proofreader`)
 - Toolchain: `src/pdf_pipeline.py` — two subcommands:
-  - `pdf2md <input.pdf> [--out <output.md>]` — PDF → Markdown via `pymupdf4llm` (text-layer pages only; image-only pages skipped)
-  - `annotate <input.pdf> <findings.json> [--out <annotated.pdf>] [--author <name>]` — locates each finding's original text on the **original PDF** and adds a Highlight annotation + popup (original, suggested fix, fix-class tag). Colors: must_fix=amber, polish=light-yellow, verify=light-blue, tgscc=light-red, variant=amber, structure=light-blue, names=light-green. Output defaults to `{stem}_审阅版.pdf`.
+  - `pdf2md <input.pdf> [--out <output.md>]` — PDF → Markdown via `pymupdf4llm`. Prints a count + list of text-layer-less pages (illustration/chapter-title/scan pages) that are skipped.
+  - `annotate <input.pdf> <findings.json> [--out <annotated.pdf>] [--author <name>] [--dry-run] [--csv <path>]` — locates each finding's original text on the **original PDF** and adds a Highlight annotation + popup (original, suggested fix, fix-class tag). Colors: must_fix=amber, polish=light-yellow, verify=light-blue, tgscc=light-red, variant=amber, structure=light-blue, names=light-green. Outputs default to `{stem}_审阅版.pdf` + `{stem}_批注清单.csv`.
 
-PDF proofreading flow (used by the agent):
+### Three-tier location strategy (annotate)
+
+1. **`exact`** — character-level full-text index (`get_text("dict")` line bboxes). Finds the de-whitespaced sentence anywhere in the whole book and maps the span back to per-line rects, so **cross-line and cross-page continuous text is highlighted in one pass** (the core fix — `page.search_for` cannot match across line breaks).
+2. **`fragment`** — longest pure-fragment fallback when the full sentence is split by page headers/footers (common in this PDF: page tail `…答曰："特` + next-page header `002 技术垄断…` + body `乌斯…`). Hits the longest in-page fragment.
+3. **`fuzzy`** — `rapidfuzz` sliding-window match (len≥4, `score_cutoff=85`, head/tail `partial_ratio` ≥80). Marked "待复核" in the CSV.
+
+Match `method` and `page` are recorded per finding in the CSV. Skips are classified: no original field / length out of range (<2 or >200 chars) / unlocatable.
+
+### PDF proofreading flow (used by the agent)
 
 ```bash
 python3 src/pdf_pipeline.py pdf2md  <book.pdf> --out <book.md>
 proofread max <book.md> --no-view                       # all stages → *_max_results.json
-python3 src/pdf_pipeline.py annotate <book.pdf> <book>_max_results.json --author "AI审校"
+python3 src/pdf_pipeline.py annotate <book.pdf> <book>_max_results.json --dry-run --csv <preview.csv>   # preview hit rate
+python3 src/pdf_pipeline.py annotate <book.pdf> <book>_max_results.json --author "AI审校"               # → _审阅版.pdf + _批注清单.csv
 ```
 
 `annotate` accepts both grouped findings (`{"llm":[...],"tgscc":[...]}`) and
-flat lists. Findings shorter than 2 chars or longer than 200 chars are skipped
-(to avoid false matches); unlocatable findings (no text layer / cross-page
-split) are logged and skipped. Requires PyMuPDF (`pip install pymupdf`; system
-Python 3.14 on this machine already has it).
+flat lists. Requires PyMuPDF + rapidfuzz + pymupdf4llm (system Python 3.14 on
+this machine already has all three).
 
-**Note**: the Tencent Docs MCP connector has **no PDF annotation tools** (only
-doc/Word `insert_comment` / `accept_all_revisions`), so PDF highlight writeback
-is done locally via PyMuPDF — no cloud round-trip needed.
+### Why local PyMuPDF (not Tencent Docs / WorkBuddy native)
+
+Verified 2026-08-05 — **no native PDF annotation API exists** in the WorkBuddy ecosystem:
+
+- **WorkBuddy V5.3.5「人机双写」** (2026-07-30) supports **Word / Excel / PPT / Markdown** in-place editing only; **PDF is not in scope** (the official PDF test case was "replicate PDF as PPT").
+- **Tencent Docs MCP plugin** (local `tencent-docs-plugin`): `grep -ri pdf` returns **zero** hits — no PDF annotation tools; only doc/Word `insert_comment` / `accept_all_revisions`, and the connector is currently disconnected.
+- **`tencent-local-office-edit` skill** explicitly states: `.pdf` / `.ofd` are view-only, no editing tools.
+- Tencent Docs **web UI** does support manual PDF annotation (rect highlight / pen / voice), but that is a **manual UI operation** with **no MCP/API exposure** — not programmable.
+
+Hence local PyMuPDF is the only reliable programmatic path; the produced PDF
+annotations are standard and open in any PDF reader / Tencent Docs viewer.
 
 ## Running tests
 
