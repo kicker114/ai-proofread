@@ -15,12 +15,30 @@
 
 ### 1. 安装
 
-```bash
+```zsh
 cd ai-proofread
 pip install -e . --break-system-packages   # macOS Homebrew Python 需此参数
 ```
 
 安装后 `proofread` 命令全局可用（从任意目录调用）。
+
+### Codex 项目入口
+
+在 Codex 中打开本仓库后，根目录 `AGENTS.md` 会自动把 Word/PDF 审校请求路由到
+项目 Skill：`$ai-proofread`。入口只在本仓库生效，不需要 OfficeCLI、docx-mcp
+或 Adeu MCP。
+
+```text
+$ai-proofread 用 pipeline 模式审校 /绝对路径/稿件.docx
+$ai-proofread 用 codex-native 模式审校 /绝对路径/书稿.pdf，并联网核验事实项
+```
+
+- `pipeline`（默认）：复用 DeepSeek max 流水线；调用模型 API，但不等同于实时联网检索。
+- `codex-native`：Codex 读取带位置的审校源文件，按项目规则生成 findings；联网核验时把来源写入批注。
+- 两种模式最终都调用同一套本地 02 OOXML / PyMuPDF 写回引擎，且不覆盖原文件。
+
+长文的 `codex-native` 审校按连续位置分批，每批最多 40 个单元且约不超过 12,000
+个非空白字符；批次 checkpoint 和最终覆盖审计用于证明每个 `P<n>` / 页码均已审阅。
 
 ### 2. 配置 API Key
 
@@ -39,7 +57,7 @@ ALIYPUN_API_KEY=          # 可选，阿里云百炼才需要
 
 将 MDict 格式词典放到任意路径，max 模式的 `--names` 会调用：
 
-```bash
+```zsh
 # 推荐路径（max_pipeline.py 中 DICT_PATHS 可改）
 /Users/kicker114/Downloads/辞典/常用词典/现代汉语词典第7版/现代汉语词典第7版.mdx
 /Users/kicker114/Downloads/辞典/常用词典/汉语辞海.mdx
@@ -51,11 +69,12 @@ ALIYPUN_API_KEY=          # 可选，阿里云百炼才需要
 
 ## CLI 命令速查
 
-```bash
+```zsh
 proofread p  <file.md|docx>              # 单文件快速校对（全文重写）
 proofread b  <file.md|docx>              # 全书分块校对（带上下文，异步并发）
 proofread m  <file.md|docx>              # ★ 最大化检查（全环节打通）
 proofread w  <file.docx>                 # DOCX 修订+批注回写
+proofread x  <file.docx|pdf>             # 导出 Codex 位置化审校源 JSON
 proofread d  <原稿.md> <校后.md>           # 生成 HTML 词级 diff
 proofread s  <file.md>                   # TGSCC 汉字规范专项检查
 ```
@@ -71,7 +90,20 @@ proofread s  <file.md>                   # TGSCC 汉字规范专项检查
 
 ### 子命令简写
 
-`p`=proofread `b`=book `m`=max `d`=diff `s`=special
+`p`=proofread `b`=book `m`=max `w`=writeback `x`=extract `d`=diff `s`=special
+
+### Codex-native 交换格式
+
+```zsh
+proofread extract 稿件.docx --out 稿件_review_source.json
+proofread extract 书稿.pdf --out 书稿_review_source.json
+```
+
+审校源使用 `ai-proofread.source.v1`，包含原文件 SHA-256，以及 Word 的 `P<n>`
+或 PDF 的一基页码。Codex 产出的 `ai-proofread.findings.v1` 使用以下核心字段：
+`fix_class`、`current`、`suggested`、`reason`、`category`，联网依据可放入
+`evidence[{title,url,accessed_at}]`。规范数组名是 `issues`；PDF 每条 issue 必须有
+一基整数 `page`。写回会校验源文件哈希，拒绝把旧 findings 应用到另一版本。
 
 ---
 
@@ -79,9 +111,9 @@ proofread s  <file.md>                   # TGSCC 汉字规范专项检查
 
 一条命令串联全部审校环节，产物：
 - `{doc}_refined.md` — 精修版全文（保持原格式，精准句改）
+- `{doc}_max_results.json` — 全阶段 findings（Word 来源时含源 SHA-256）
 - `{doc}_max_report.html` — 综合报告（聚合全部阶段）
 - `{doc}_alignment.html` — 句子级对齐勘误表
-- `{doc}_diff.html` — 词级 diff
 
 ### 管线各阶段
 
@@ -105,7 +137,8 @@ proofread s  <file.md>                   # TGSCC 汉字规范专项检查
 
 ## 输入文件格式要求
 
-模型只处理文本。支持 `.md`（直接）和 `.docx`（自动转换）。
+模型只处理文本。支持 `.md`（直接）和 `.docx`（自动转换）；旧 `.doc` 需先转换为
+`.docx`。PDF 必须带文字层，纯扫描件需先 OCR。
 
 **Markdown 要求**（决定分块质量）：
 1. 标题级别：若干 `#` 后加一个空格
@@ -115,7 +148,7 @@ proofread s  <file.md>                   # TGSCC 汉字规范专项检查
 
 **PDF**：原生支持。`src/pdf_pipeline.py pdf2md` 直接转 Markdown + 审校后 PyMuPDF 高亮批注回写（见下方「PDF 审校工具链」）。
 
-```bash
+```zsh
 # docx → markdown（保留脚注、表格）
 pandoc -f docx -t markdown-smart+pipe_tables+footnotes \
   --wrap=none --toc --extract-media="./attachments/%name%" \
@@ -130,13 +163,19 @@ pandoc -f docx -t markdown-smart+pipe_tables+footnotes \
 
 **引擎**：**02 引擎（直接 OOXML，默认）**——纯 lxml+zipfile 操作 `word/document.xml`，
 按 P 编号定位段落，用 `difflib` 做字符级最小 diff，直接插入 `<w:del>/<w:ins>` 修订
-和 `<w:comment>` 批注。零中间文本转换损耗，保留既有修订。
+和 `<w:comment>` 批注。引擎只拆分命中的文本节点，保留未命中 run、超链接、表格及
+既有修订；字段、超链接、受保护结构、错误 P 位置或模糊定位不会跨段强改，而是跳过
+或降级为待核批注。过大的扩写同样受振幅门禁保护。
 
 ### 用法
 
-```bash
+```zsh
 # 独立回写（已有 findings JSON）
 proofread w 稿件.docx --findings findings.json
+
+# 旧版无哈希 findings 必须绑定 proofread extract 生成的源清单
+proofread w 稿件.docx --findings old_max_results.json \
+  --source-manifest 稿件_review_source.json
 
 # 一键回写（审校 → 回写一条龙）
 proofread m 稿件.docx --writeback --author "审校助手"
@@ -176,7 +215,9 @@ proofread w  <docx>  [--findings PATH] [--out PATH] [--author NAME] [--engine 02
 proofread m  <docx>  --writeback [--author NAME]
 ```
 
-`--findings` 不传时自动搜索同目录 `_max_results.json`。
+`--findings` 不传时自动搜索同目录 `_max_results.json`。新版 Word max 结果自带源哈希；
+旧版无哈希结果必须传 `--source-manifest`。`--out` 始终另存；输出完成后会审计
+DOCX ZIP/XML、修订文本、批注 ID 和包关系，失败或全部发现均无法定位时命令返回非零状态。
 
 ---
 
@@ -184,20 +225,29 @@ proofread m  <docx>  --writeback [--author NAME]
 
 `src/pdf_pipeline.py` 提供完整的 PDF 审校链路，无需手动 pandoc 转换：
 
-```bash
-# 1. PDF → Markdown（pymupdf4llm，提取文本层）
+```zsh
+# 1. 生成页码化源文件清单与 SHA-256
+proofread extract book.pdf --out book_review_source.json
+
+# 2. PDF → Markdown（pymupdf4llm，提取文本层）
 python3 src/pdf_pipeline.py pdf2md book.pdf --out book.md
 
-# 2. 走 max 管线审校
+# 3. 走 max 管线审校
 proofread m book.md --no-view
 
-# 3. dry-run 预览批注命中率
-python3 src/pdf_pipeline.py annotate book.pdf book_max_results.json --dry-run --csv preview.csv
+# 4. dry-run 预览批注命中率
+python3 src/pdf_pipeline.py annotate book.pdf book_max_results.json \
+  --source-manifest book_review_source.json --dry-run --csv preview.csv
 
-# 4. 正式回写 PDF 高亮批注
-python3 src/pdf_pipeline.py annotate book.pdf book_max_results.json --author "AI审校"
+# 5. 正式回写 PDF 高亮批注（默认只应用唯一 exact 命中）
+python3 src/pdf_pipeline.py annotate book.pdf book_max_results.json \
+  --source-manifest book_review_source.json --author "AI审校"
 # → book_审阅版.pdf + book_批注清单.csv
 ```
+
+`pdf2md` 会逐页比较 pymupdf4llm 与 PyMuPDF 原始文字层的文字保留率，而非只比较长度。
+当某页低于 75% 时自动改用该页 `get_text("text", sort=True)`，并打印降级页码与
+覆盖率，避免复杂图文排版静默漏掉大段正文。
 
 ### annotate 三层定位策略
 
@@ -205,11 +255,19 @@ PyMuPDF 的 `page.search_for()` 无法跨行匹配。本工具采用三层回退
 
 | 层级 | 策略 | 说明 |
 |------|------|------|
-| `exact` | 字符级全文本索引 | `get_text("dict")` 逐行 bbox，跨行/跨页连续文本一次高亮 |
-| `fragment` | 最长纯片段回退 | 当句子被页眉页脚打断时，命中页内最长片段 |
-| `fuzzy` | rapidfuzz 滑动窗口 | len≥4, score≥85，标记「待复核」 |
+| `exact` | 字符级全文本索引 | `rawdict` 字符 bbox 生成逐行 quads；只有唯一命中才自动写入 |
+| `fragment` | 最长纯片段回退 | dry-run 默认只报告；人工确认后用 `--allow-fragment` 写入 |
+| `fuzzy` | rapidfuzz 滑动窗口 | 默认只预览；并列最高分始终 ambiguous，显式允许也不写入 |
 
-每条的匹配方法和页码记录在 `_批注清单.csv` 中。批注颜色按 fix_class 区分：`must_fix`=amber，`polish`=浅黄，`verify`=浅蓝，`tgscc`=浅红。
+重复原文会枚举所有候选；只有 findings 提供的 `page` 能唯一消歧时才写入，否则 CSV
+记录 `ambiguous`。CSV 同时记录匹配方法、真实分数、候选页、quad 数和跳过原因。
+批注颜色按 fix_class 区分：`must_fix`=amber，`polish`=浅黄，`verify`=浅蓝，`tgscc`=浅红。
+
+pipeline 的 legacy `max_results.json` 可能没有源 PDF 哈希，因此 PDF dry-run 和正式
+写回都必须传入 `proofread extract` 生成的 `--source-manifest`。输出 PDF 经重开审计
+通过后才原子替换既有审阅版。
+
+> 仅支持带文字层 PDF。纯扫描 PDF 需先 OCR；混合 PDF 的无文字层页面会明确列出并跳过。
 
 ### WorkBuddy 入口
 
@@ -222,6 +280,7 @@ PyMuPDF 的 `page.search_for()` 无法跨行匹配。本工具采用三层回退
 | 模块 | 路径 | 用途 |
 |------|------|------|
 | CLI 入口 | `src/cli.py` | `proofread` 命令定义 |
+| Codex 提取 | `src/extract_source.py` | DOCX/PDF → 带位置与 SHA-256 的审校源 |
 | 最大化管线 | `src/max_pipeline.py` | max 模式编排 |
 | **DOCX 回写引擎** | `src/writeback_engine.py` | 02 引擎：直接 OOXML 字符级修订+批注 |
 | **回写适配** | `src/writeback.py` | Adeu MCP 旧方案（`--engine adeu`） |
@@ -235,6 +294,22 @@ PyMuPDF 的 `page.search_for()` 无法跨行匹配。本工具采用三层回退
 | 结构检查 | `src/structure_checker/` | 层级 + 编号连续性（已补 hierarchy_gap） |
 | 词典查询 | `src/special_checker/mdict.py` | MDict 查询，`query_mdx(mdx, word)` |
 | 词级 diff | `src/diff_tools.py` | HTML 词级差异（已修转义） |
+
+---
+
+## 回归测试
+
+```zsh
+python3 -m unittest \
+  tests.test_extract_source \
+  tests.test_codex_entry \
+  tests.test_pdf_pipeline \
+  tests.test_word_writeback
+```
+
+测试覆盖 Codex Skill、DOCX 表格提取、findings 哈希门禁、Word OOXML 修订批注、
+PDF quads/歧义/降级策略以及输入文件防覆盖。旧的 `test_performance.py` 和
+`test_two_stage.py` 仍引用已移除的 `src.sentence_aligner_simple`，不属于当前回归门。
 
 ---
 

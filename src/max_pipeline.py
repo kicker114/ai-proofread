@@ -76,15 +76,27 @@ def _json_extract(text: str) -> Optional[List[Dict]]:
 
 def _save_findings(path: str, results: Dict[str, Any]) -> None:
     """将 max pipeline 各阶段发现序列化到 JSON，供 writeback 使用。"""
-    export = {}
-    for key in ("tgscc", "variants", "structure", "llm", "names"):
-        data = results.get(key, [])
-        if isinstance(data, list) and data:
-            export[key] = data
-    if export:
-        with open(path, "w", encoding="utf-8") as f:
+    export = {
+        key: results.get(key, [])
+        for key in ("tgscc", "variants", "structure", "llm", "names")
+        if isinstance(results.get(key, []), list)
+    }
+    for key in ("source_path", "source_sha256"):
+        value = results.get(key)
+        if value:
+            export[key] = value
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(export, f, ensure_ascii=False, indent=2)
-        print(f"  发现 JSON: {path}")
+            f.write("\n")
+        os.replace(temp_path, destination)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+    print(f"  发现 JSON: {path}")
 
 
 # ── P 编号文本池（与 writeback_engine.build_para_map 逐字节一致）──────
@@ -146,7 +158,7 @@ def _find_source_docx(file_arg: str) -> Optional[str]:
     if fpath.suffix.lower() == ".docx" and fpath.exists():
         return str(fpath)
     stem = fpath.parent / fpath.stem
-    for ext in (".docx", ".doc"):
+    for ext in (".docx",):
         candidate = stem.parent / f"{stem.name}{ext}"
         if candidate.exists():
             return str(candidate)
@@ -157,9 +169,10 @@ def _resolve_findings_to_p(findings: List[Dict], text_map: Dict[int, str]) -> Li
     """把 finding 定位到具体 P 段落，补充 pn/current/location。
 
     策略：
-      1. 先在每段做精确子串匹配（real_text/current/original/char 命中即锁定，ratio=100）
-      2. 未命中 → find_best_match 模糊定位（每段取最高 ratio）
-      3. 均未命中 → 保留原 location（不强制 P）
+      1. 有效显式 P 只在该段内解析，不跨段静默改址。
+      2. 无显式 P 时，精确命中必须全书唯一。
+      3. 模糊命中必须有唯一且明显领先的最高分。
+      4. 重复、并列或未命中的 finding 跳过写回，仍保留在报告中。
     """
     from .special_checker.match_similar_text import find_best_match
 
@@ -176,36 +189,74 @@ def _resolve_findings_to_p(findings: List[Dict], text_map: Dict[int, str]) -> Li
         key_text = re.sub(r"^#{1,6}\s*", "", key_text).strip()
         key_text = re.sub(r"^\s*[-*]\s+", "", key_text).strip()
         if not key_text:
-            f.setdefault("location", f"P{items[0][0]}")
-            resolved.append(f)
             continue
 
-        # 1. 精确子串
         best = None
-        for pn, ptext in items:
+        requested_pn = f.get("pn")
+        if not isinstance(requested_pn, int):
+            location = str(f.get("location", "")).strip()
+            match = re.fullmatch(r"P(\d+)", location)
+            requested_pn = int(match.group(1)) if match else None
+
+        if requested_pn is not None and requested_pn in text_map:
+            ptext = text_map[requested_pn]
             if key_text in ptext:
-                best = {"pn": pn, "real_text": key_text, "ratio": 100.0}
-                break
-        # 2. 模糊定位（只在精确未命中时）—— current 优先取段落内
-        #    与 key_text 最长公共前缀/后缀的精确子串，避免模糊片段
-        if best is None and len(key_text) >= 2:
+                best = {"pn": requested_pn, "real_text": key_text,
+                        "ratio": 100.0, "match_method": "exact"}
+            elif len(key_text) >= 2:
+                bm = find_best_match(ptext, key_text)
+                if bm.get("real_text") and bm.get("ratio", 0) >= 60:
+                    exact = _longest_common_substring(key_text, ptext)
+                    anchor = exact if exact and len(exact) >= 2 else bm["real_text"]
+                    best = {"pn": requested_pn, "real_text": anchor,
+                            "ratio": bm["ratio"], "match_method": "fuzzy"}
+            if best is None:
+                print(f"  WARN: 显式 P{requested_pn} 未找到锚点，跳过写回: {key_text[:30]}")
+                continue
+        elif requested_pn is not None:
+            print(f"  WARN: P{requested_pn} 超出文档范围，跳过写回: {key_text[:30]}")
+            continue
+        else:
+            exact_candidates = [
+                {"pn": pn, "real_text": key_text, "ratio": 100.0}
+                for pn, ptext in items if key_text in ptext
+            ]
+            if len(exact_candidates) == 1:
+                best = exact_candidates[0]
+            elif len(exact_candidates) > 1:
+                pages = ", ".join(f"P{item['pn']}" for item in exact_candidates[:8])
+                print(f"  WARN: 锚点跨段重复（{pages}），跳过写回: {key_text[:30]}")
+                continue
+
+        # 无精确命中时做模糊定位，并要求最高分唯一领先。
+        if best is None and requested_pn is None and len(key_text) >= 2:
+            fuzzy_candidates = []
             for pn, ptext in items:
                 bm = find_best_match(ptext, key_text)
                 if bm.get("real_text") and bm.get("ratio", 0) >= 60:
-                    # 在段落里找 key_text 的最长精确子串
                     exact = _longest_common_substring(key_text, ptext)
                     anchor = exact if exact and len(exact) >= 2 else bm["real_text"]
-                    if best is None or bm["ratio"] > best["ratio"]:
-                        best = {"pn": pn, "real_text": anchor, "ratio": bm["ratio"]}
+                    fuzzy_candidates.append({
+                        "pn": pn, "real_text": anchor, "ratio": bm["ratio"],
+                        "match_method": "fuzzy"})
+            fuzzy_candidates.sort(key=lambda item: item["ratio"], reverse=True)
+            if fuzzy_candidates:
+                top = fuzzy_candidates[0]
+                runner_up = fuzzy_candidates[1] if len(fuzzy_candidates) > 1 else None
+                if runner_up and top["ratio"] - runner_up["ratio"] < 5:
+                    print(f"  WARN: 模糊锚点并列，跳过写回: {key_text[:30]}")
+                    continue
+                best = top
 
         if best:
             f["pn"] = best["pn"]
             f["current"] = best["real_text"]
             f["location"] = f"P{best['pn']}"
             f["p_ratio"] = best["ratio"]
+            f["p_match_method"] = best.get("match_method", "exact")
+            resolved.append(f)
         else:
-            f.setdefault("location", f"P{items[0][0]}")
-        resolved.append(f)
+            print(f"  WARN: finding 未定位，跳过写回: {key_text[:30]}")
     return resolved
 
 
@@ -252,6 +303,15 @@ def _findings_to_issues(findings: List[Dict]) -> List[Dict]:
 
         if phase.startswith("0c_structure"):
             continue  # 结构诊断在 max report 呈现，不写回 DOCX
+
+        if f.get("p_match_method") == "fuzzy":
+            issues.append({
+                "fix_class": "verify", "location": location,
+                "current": current, "suggested": suggested,
+                "reason": "模糊定位，仅供人工确认。" + reason,
+                "category": "定位待核",
+            })
+            continue
 
         if phase.startswith("0a_tgscc"):
             # 单字：剥离注释只取替换字
@@ -680,15 +740,17 @@ def run_max(
     writeback=True 时，审校完成后直接把发现回写到 DOCX（02 引擎，字符级修订+批注）。
     """
     from .cli import _resolve_input  # 复用 DOCX→MD 转换
+    from .extract_source import sha256_file
     from .splitter import split_markdown_by_title_and_length_with_context
 
     fpath = Path(file_path)
+    src_docx = _find_source_docx(file_path)
+    src_docx_sha256 = sha256_file(src_docx) if src_docx else None
     md_path = _resolve_input(fpath)
     with open(md_path, "r", encoding="utf-8") as f:
         text = f.read()
 
     # 源 docx 路径（用于 P 编号映射和回写）
-    src_docx = _find_source_docx(file_path)
     text_map: Dict[int, str] = {}
     if src_docx:
         text_map = _build_para_text_map(src_docx)
@@ -697,6 +759,9 @@ def run_max(
     out_dir = str(md_path.parent)
     docname = md_path.stem
     results: Dict[str, Any] = {}
+    if src_docx and src_docx_sha256:
+        results["source_path"] = str(Path(src_docx).resolve())
+        results["source_sha256"] = src_docx_sha256
 
     print("╔════════════════════════════════════════════╗")
     print("║  ai-proofread · 最大化检查模式             ║")
@@ -746,9 +811,8 @@ def run_max(
     print(f"  精修版: {refined_path}")
     results["refined_path"] = refined_path
 
-    # 保存完整发现 JSON（供 writeback 使用）
+    # findings 文件在 Phase 2 后统一保存，确保 names 和源文件哈希不遗漏。
     findings_path = os.path.join(out_dir, f"{docname}_max_results.json")
-    _save_findings(findings_path, results)
     results["findings_path"] = findings_path
 
     # ── Phase 2: 专名查词（可选） ──
@@ -756,7 +820,8 @@ def run_max(
     if run_names:
         print("\n[Phase 2] 专名查词...")
         names = phase2_names(refined_text, model=model)
-        results["names"] = names
+    results["names"] = names
+    _save_findings(findings_path, results)
 
     # ── Phase 3: 句子对齐 ──
     print("\n[Phase 3] 句子对齐...")
@@ -779,7 +844,10 @@ def run_max(
     # ── Phase 5: DOCX 回写（02 引擎，直接 OOXML） ──
     if writeback and src_docx:
         print("\n[Phase 5] DOCX 回写（02 引擎，直接 OOXML）...")
-        all_findings = llm + tgscc + variants + structure
+        current_sha256 = sha256_file(src_docx)
+        if current_sha256 != src_docx_sha256:
+            raise RuntimeError("源 DOCX 在审校期间发生变化，拒绝写回")
+        all_findings = llm + tgscc + variants + structure + names
         resolved = _resolve_findings_to_p(all_findings, text_map)
         issues = _findings_to_issues(resolved)
         n_must = sum(1 for i in issues if i["fix_class"] == "must_fix")
@@ -788,7 +856,9 @@ def run_max(
         print(f"  ✓ 定位 {len(resolved)} 条发现 → {len(issues)} 条 issues"
               f"（必改 {n_must} + 润色 {n_polish} + 待核 {n_verify}）")
 
-        review_path = _run_02_writeback(src_docx, docname, issues, author)
+        review_path = _run_02_writeback(
+            src_docx, docname, issues, author,
+            expected_source_sha256=src_docx_sha256)
         results["review_path"] = review_path
         print(f"  ✓ 审阅版: {review_path}")
 
@@ -797,40 +867,81 @@ def run_max(
 
 
 def _run_02_writeback(src_docx: str, docname: str,
-                      issues: List[Dict], author: str) -> str:
+                      issues: List[Dict], author: str,
+                      out_path: Optional[str] = None,
+                      expected_source_sha256: Optional[str] = None) -> str:
     """调用 02 引擎把 issues[] 回写到 DOCX。
 
     建 output_<docname>/results/ 目录结构（02 引擎约定），subprocess 调用
     writeback_engine.py，输出 <docname>_审阅版.docx。
     """
+    import shutil
     import subprocess
-    from .writeback_engine import __file__ as ENGINE_PATH
+    import tempfile
+    from .extract_source import sha256_file
+    from .writeback_engine import __file__ as ENGINE_PATH, audit_docx
 
-    # 02 引擎的 output_dir 约定：父目录需存在源 docx（stem 匹配）
-    parent = os.path.dirname(src_docx)
-    out_dir = os.path.join(parent, f"output_{docname}")
-    results_dir = os.path.join(out_dir, "results")
-    os.makedirs(results_dir, exist_ok=True)
-
-    # 写 issues[]（02 引擎 load_findings 读 results/*.json 的 issues 键）
-    issues_path = os.path.join(results_dir, "max_findings.json")
-    with open(issues_path, "w", encoding="utf-8") as f:
-        json.dump({"issues": issues}, f, ensure_ascii=False, indent=2)
+    actionable = [
+        issue for issue in issues
+        if (isinstance(issue, dict)
+            and issue.get("fix_class") in ("must_fix", "polish", "verify")
+            and str(issue.get("location", "")).strip()
+            and str(issue.get("current", "")).strip())
+    ]
+    if not actionable:
+        raise ValueError("没有可写回的 Word findings")
 
     # 输出路径（显式指定，避免 02 引擎默认路径歧义）
-    out_docx = os.path.join(out_dir, f"{docname}_审阅版.docx")
+    parent = os.path.abspath(os.path.dirname(src_docx) or ".")
+    delivery_dir = os.path.join(parent, f"output_{docname}")
+    out_docx = os.path.abspath(
+        out_path or os.path.join(delivery_dir, f"{docname}_审阅版.docx"))
+    if Path(src_docx).resolve() == Path(out_docx).resolve():
+        raise ValueError("输出路径不能覆盖源 DOCX")
+    os.makedirs(os.path.dirname(out_docx), exist_ok=True)
+    bound_source_sha256 = (
+        expected_source_sha256.lower()
+        if expected_source_sha256 else sha256_file(src_docx))
 
-    cmd = [sys.executable, ENGINE_PATH, out_dir,
-           "--author", author, "--out", out_docx]
-    print(f"  ⚙️  02 引擎: {' '.join(os.path.basename(c) if i in (0, 1) else c for i, c in enumerate(cmd))}")
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.stdout:
-        print(proc.stdout)
-    if proc.stderr:
-        print(proc.stderr, file=sys.stderr)
-    if proc.returncode != 0:
-        print(f"  ❌ 02 引擎退出码 {proc.returncode}", file=sys.stderr)
-        return out_docx
+    # 02 引擎仍使用 output_<stem>/results 约定。为每次调用建立隔离目录，
+    # 避免真实 output_<stem>/results 中的历史 JSON 被再次加载。
+    with tempfile.TemporaryDirectory(
+            prefix=".ai-proofread-writeback-", dir=parent) as stage_parent:
+        staged_source = os.path.join(stage_parent, os.path.basename(src_docx))
+        shutil.copy2(src_docx, staged_source)
+        if sha256_file(staged_source) != bound_source_sha256:
+            raise RuntimeError("源 DOCX 在校验与快照之间发生变化，拒绝写回")
+        engine_stem = Path(src_docx).stem
+        engine_out_dir = os.path.join(stage_parent, f"output_{engine_stem}")
+        results_dir = os.path.join(engine_out_dir, "results")
+        os.makedirs(results_dir, exist_ok=True)
+        issues_path = os.path.join(results_dir, "max_findings.json")
+        with open(issues_path, "w", encoding="utf-8") as f:
+            json.dump({"issues": actionable}, f, ensure_ascii=False, indent=2)
+
+        staged_output = os.path.join(stage_parent, "review-output.docx")
+        cmd = [sys.executable, ENGINE_PATH, engine_out_dir,
+               "--author", author, "--out", staged_output]
+        print(f"  ⚙️  02 引擎: {' '.join(os.path.basename(c) if i in (0, 1) else c for i, c in enumerate(cmd))}")
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.stdout:
+            print(proc.stdout)
+        if proc.stderr:
+            print(proc.stderr, file=sys.stderr)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or '').strip()
+            raise RuntimeError(
+                f"02 引擎退出码 {proc.returncode}"
+                + (f": {detail}" if detail else ""))
+        if not os.path.isfile(staged_output):
+            raise RuntimeError(f"02 引擎未生成输出: {staged_output}")
+        try:
+            audit_docx(staged_output, expected_author=author)
+        except Exception as exc:
+            raise RuntimeError(f"02 引擎输出未通过 OOXML 审计: {exc}") from exc
+        if sha256_file(src_docx) != bound_source_sha256:
+            raise RuntimeError("源 DOCX 在写回期间发生变化，拒绝交付")
+        os.replace(staged_output, out_docx)
     return out_docx
 
 

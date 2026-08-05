@@ -8,7 +8,7 @@ A Chinese book manuscript proofreading CLI toolkit, forked from Fusyong/ai-proof
 
 ## Install & run
 
-```bash
+```zsh
 pip install -e . --break-system-packages   # macOS Homebrew Python needs --break-system-packages
 ```
 
@@ -26,16 +26,52 @@ ALIYPUN_API_KEY=       # optional (Aliyun Bailian, for deepseek-v3)
 
 ## CLI commands (from project root)
 
-```bash
+```zsh
 proofread p  <file.md|docx>              # single-file full rewrite proofread
 proofread b  <file.md|docx>              # book: split → async pipeline
 proofread m  <file.md|docx>              # ★ max pipeline (all stages)
 proofread w  <file.docx>                 # DOCX track-changes + comment writeback
+proofread x  <file.docx|pdf>             # location-preserving source export for Codex
 proofread d  <original.md> <proofed.md>  # HTML word-level diff
 proofread s  <file.md>                   # TGSCC Chinese character spec check
 ```
 
 Key flags: `--model` (default `deepseek-v4-flash`), `--concurrent N` (LLM concurrency, default 3), `--rpm N` (API rate limit), `--names` (max mode proper-noun dictionary lookup), `--writeback` (max mode auto-writeback to DOCX).
+
+## Codex project entry (Word + PDF)
+
+Codex automatically reads the repository-root `AGENTS.md` and discovers the
+project-local `$ai-proofread` Skill at `.agents/skills/ai-proofread/SKILL.md`.
+`agents/openai.yaml` supplies the Codex UI metadata. This entry is deliberately
+repository-local; do not install or duplicate it under `~/.codex/skills`.
+
+The Skill has two review modes while sharing one deterministic writeback layer:
+
+- `pipeline` (default): run the existing DeepSeek max pipeline. Calling the
+  DeepSeek API is not live web research.
+- `codex-native`: run `proofread extract`, let Codex review the positioned text
+  under the repository rules, optionally verify factual claims on the web, and
+  produce `ai-proofread.findings.v1` for the existing writers.
+
+`proofread extract <source.docx|source.pdf> --out <review_source.json>` emits
+`ai-proofread.source.v1`, the source SHA-256, and units addressed by Word `P<n>`
+or one-based PDF page. Native findings use an `issues` array with
+`fix_class/current/suggested/reason/category`, plus `location` for DOCX or
+`page` for PDF. Optional `evidence[{title,url,accessed_at}]` is rendered into the
+annotation. Writers reject a findings file whose `source_sha256` does not match.
+For long native reviews, process contiguous batches of at most 40 units and
+about 12,000 non-whitespace characters, persist batch checkpoints, and audit
+that every source unit was covered exactly once before merging findings.
+
+Hard gates enforced by `AGENTS.md` and the Skill:
+
+- Never overwrite the input; report absolute artifact paths.
+- DOCX output must pass package/XML/revision/comment audits.
+- PDF must run `annotate --dry-run` before formal annotation and pass the
+  `review_source.json` through `--source-manifest`. Only unique exact matches
+  apply by default; partial/fuzzy matches require explicit opt-in, while tied
+  fuzzy candidates remain ambiguous even with opt-in.
+- Do not route new work through Adeu, OfficeCLI, docx-mcp, or an MCP server.
 
 ## WorkBuddy agent entry (PDF proofreading)
 
@@ -45,29 +81,43 @@ back as **highlight annotations on the original PDF**:
 
 - Agent definition: `.workbuddy/agents/pdf-proofreader.md` (name `pdf-proofreader`)
 - Toolchain: `src/pdf_pipeline.py` — two subcommands:
-  - `pdf2md <input.pdf> [--out <output.md>]` — PDF → Markdown via `pymupdf4llm`. Prints a count + list of text-layer-less pages (illustration/chapter-title/scan pages) that are skipped.
-  - `annotate <input.pdf> <findings.json> [--out <annotated.pdf>] [--author <name>] [--dry-run] [--csv <path>]` — locates each finding's original text on the **original PDF** and adds a Highlight annotation + popup (original, suggested fix, fix-class tag). Colors: must_fix=amber, polish=light-yellow, verify=light-blue, tgscc=light-red, variant=amber, structure=light-blue, names=light-green. Outputs default to `{stem}_审阅版.pdf` + `{stem}_批注清单.csv`.
+  - `pdf2md <input.pdf> [--out <output.md>]` — PDF → Markdown via `pymupdf4llm`. Each page is compared with PyMuPDF sorted raw text by retained source characters, not length alone; when coverage is below 75%, that page falls back to the complete raw text and reports its coverage. Text-layer-less pages are listed and skipped.
+  - `annotate <input.pdf> <findings.json> [--source-manifest <review_source.json>] [--out <annotated.pdf>] [--author <name>] [--dry-run] [--csv <path>] [--allow-fragment] [--allow-fuzzy]` — validates native findings or legacy manifest binding, locates each finding's original text on the **original PDF**, and adds a Highlight annotation + popup (original, suggested fix, fix-class tag, optional evidence). Colors: must_fix=amber, polish=light-yellow, verify=light-blue, tgscc=light-red, variant=amber, structure=light-blue, names=light-green. Outputs default to `{stem}_审阅版.pdf` + `{stem}_批注清单.csv` after atomic write-and-reopen validation.
 
 ### Three-tier location strategy (annotate)
 
-1. **`exact`** — character-level full-text index (`get_text("dict")` line bboxes). Finds the de-whitespaced sentence anywhere in the whole book and maps the span back to per-line rects, so **cross-line and cross-page continuous text is highlighted in one pass** (the core fix — `page.search_for` cannot match across line breaks).
-2. **`fragment`** — longest pure-fragment fallback when the full sentence is split by page headers/footers (common in this PDF: page tail `…答曰："特` + next-page header `002 技术垄断…` + body `乌斯…`). Hits the longest in-page fragment.
-3. **`fuzzy`** — `rapidfuzz` sliding-window match (len≥4, `score_cutoff=85`, head/tail `partial_ratio` ≥80). Marked "待复核" in the CSV.
+1. **`exact`** — normalized full-text index backed by `get_text("rawdict")`
+   character bboxes. It emits one quad per visual line, supports cross-line/page
+   spans, and applies only when the match is unique. A one-based finding `page`
+   may disambiguate repeated text.
+2. **`fragment`** — longest pure-fragment fallback. It is preview-only unless
+   formal annotation explicitly passes `--allow-fragment`.
+3. **`fuzzy`** — `rapidfuzz` sliding-window match with a real score. It is
+   preview-only unless formal annotation explicitly passes `--allow-fuzzy`;
+   tied top candidates are always ambiguous and never written.
 
-Match `method` and `page` are recorded per finding in the CSV. Skips are classified: no original field / length out of range (<2 or >200 chars) / unlocatable.
+Multiple unresolved exact candidates are `ambiguous`, never silently mapped to
+the first occurrence. CSV rows record method, score, candidate pages, quad
+count, and skip reason. After writing, annotations are reopened and checked for
+Highlight subtype, author, content, and page. Location runs against a validated
+PDF snapshot, with the original path hashed again before preview output and
+formal delivery.
 
 ### PDF proofreading flow (used by the agent)
 
-```bash
+```zsh
+proofread extract <book.pdf> --out <review_source.json>
 python3 src/pdf_pipeline.py pdf2md  <book.pdf> --out <book.md>
 proofread max <book.md> --no-view                       # all stages → *_max_results.json
-python3 src/pdf_pipeline.py annotate <book.pdf> <book>_max_results.json --dry-run --csv <preview.csv>   # preview hit rate
-python3 src/pdf_pipeline.py annotate <book.pdf> <book>_max_results.json --author "AI审校"               # → _审阅版.pdf + _批注清单.csv
+python3 src/pdf_pipeline.py annotate <book.pdf> <book>_max_results.json --source-manifest <review_source.json> --dry-run --csv <preview.csv>
+python3 src/pdf_pipeline.py annotate <book.pdf> <book>_max_results.json --source-manifest <review_source.json> --author "AI审校"
 ```
 
 `annotate` accepts both grouped findings (`{"llm":[...],"tgscc":[...]}`) and
-flat lists. Requires PyMuPDF + rapidfuzz + pymupdf4llm (system Python 3.14 on
-this machine already has all three).
+flat lists. `ai-proofread.findings.v1` is validated strictly: `issues` is
+canonical, every PDF issue needs the five common fields and a one-based integer
+`page`, and every evidence item needs title, URL, and access date. Requires
+PyMuPDF + rapidfuzz + pymupdf4llm.
 
 ### Why local PyMuPDF (not Tencent Docs / WorkBuddy native)
 
@@ -83,13 +133,24 @@ annotations are standard and open in any PDF reader / Tencent Docs viewer.
 
 ## Running tests
 
-Tests are manual scripts (no pytest):
+Tests use the standard-library `unittest` runner (no pytest dependency):
 
-```bash
+```zsh
+python3 -m unittest \
+  tests.test_extract_source \
+  tests.test_codex_entry \
+  tests.test_pdf_pipeline \
+  tests.test_word_writeback
+
+# Legacy/manual suites
 python tests/test_sentence_split.py
 python tests/test_performance.py <original.md> <proofed.md>
 python tests/test_two_stage.py <original.md> <proofed.md>
 ```
+
+`test_performance.py` and `test_two_stage.py` currently import the removed
+`src.sentence_aligner_simple` module and therefore fail during discovery. This
+is a pre-existing test-suite defect, not a Codex entry dependency.
 
 ## Architecture
 
@@ -101,6 +162,7 @@ CLI (src/cli.py)
   ├── proofread b  → splitter + proofreader.process_paragraphs_async()  [chunked async]
   ├── proofread m  → max_pipeline.run_max()           [all stages, see below]
   ├── proofread w  → writeback_engine (02) or writeback (adeu)
+  ├── proofread x  → extract_source (positioned source + SHA-256)
   ├── proofread d  → diff_tools.jsdiff_md_text()
   └── proofread s  → special_checker.check_to_tgscc()
 ```
@@ -126,11 +188,21 @@ Phase 1 uses a **JSON discovery prompt** (`src/resource/prompt-proofreader-syste
 The **02 engine** (default) manipulates DOCX directly via `lxml` + `zipfile` — no intermediate text conversion:
 
 1. `build_para_map()` — walks `word/document.xml` body children, assigns P-numbers to non-empty paragraphs (includes table cells). Builds `{pn: w:p_element}` and `{pn: text}`.
-2. For `must_fix` findings: `difflib` character-level diff → `<w:del>/<w:ins>` track changes + styled `<w:comment>`.
+2. For `must_fix` findings: `difflib` character-level diff → split only the
+   affected direct text runs → `<w:del>/<w:ins>` track changes + styled
+   `<w:comment>`. Unaffected runs and properties remain byte-structurally intact.
 3. For `polish`/`verify` findings: highlight + comment only, no text change.
-4. Preserves existing revisions (accept-view text via `_para_raw_text()` — includes `<w:ins>`, excludes `<w:del>` ancestors).
+4. Preserves existing revisions (accept-view text via `_para_raw_text()` — includes `<w:ins>`, excludes `<w:del>` ancestors). A target crossing a hyperlink, field, tab/drawing, content control, protected range, or existing revision is downgraded to a comment rather than rewritten. Declared P locations never fall back to another paragraph, fuzzy P resolution is comment-only, and an amplitude budget blocks short-anchor sentence expansion.
+5. Runs a package audit before success: ZIP/XML parse, relationship targets,
+   comment marker/reference IDs, revision author/date/text, and dangling modern
+   comment parts. Each invocation uses isolated findings staging and atomically
+   replaces the requested output only after the audit passes.
 
 **P-numbering must be byte-identical** between the 02 engine and `max_pipeline._build_para_text_map()`. Both use the same `_para_raw_text()` logic and walk body children identically. Finding location strings like `P3` map directly to these paragraph indices.
+Word max captures the source DOCX hash before review, stores it in
+`_max_results.json`, and checks it again immediately before Phase 5 writeback.
+Standalone legacy Word findings without that hash require a
+`proofread extract` manifest via `proofread w --source-manifest`.
 
 The `fix_class` routing:
 - `must_fix` → character-level track changes + comment
@@ -144,6 +216,7 @@ The old **Adeu MCP** path (`src/writeback.py`, `--engine adeu`) requires Claude 
 | Module | Role |
 |--------|------|
 | `src/cli.py` | argparse CLI, DOCX→MD auto-conversion, dispatches to all pipelines |
+| `src/extract_source.py` | `ai-proofread.source.v1` export for DOCX/PDF Codex-native review |
 | `src/proofreader.py` | DeepSeek/Google API calls, `RateLimiter`, async pipeline `process_paragraphs_async()` with checkpoint resume |
 | `src/splitter.py` | Markdown split by heading levels + length, Chinese sentence segmentation (`split_chinese_sentences`) |
 | `src/max_pipeline.py` | Max pipeline orchestrator, P-number text map, finding→P resolution |
@@ -181,12 +254,15 @@ Google models (gemini-*)
 
 ### DOCX→MD conversion
 
-Done inline in `cli.py._docx_to_md()` using `python-docx`. Heading styles (`Heading 1`–`9`) become `#`–`#########`. Non-heading paragraphs pass through as-is. The `.md` is written adjacent to the source `.docx`.
+Done inline in `cli.py._docx_to_md()` through `extract_source`'s lxml OOXML
+walker. Heading styles (`Heading 1`–`9`) become `#`–`#########`. Body and
+table-cell paragraphs are emitted in document order so table text is not
+silently omitted. The `.md` is written adjacent to the source `.docx`.
 
 ## Important constraints
 
 - **P-numbering consistency**: Any change to `_para_raw_text()` or paragraph walking logic in `writeback_engine.py` must be mirrored exactly in `max_pipeline._build_para_text_map()`. They are deliberately duplicated — do NOT refactor into a shared function unless you also update all `P{n}` resolution code.
 - **Prompt files**: Two distinct system prompts in `src/resource/` — the JSON discovery prompt is used by max pipeline Phase 1; the rewrite prompt is used by `proofread p` and `proofread b`. Do not swap them.
 - **Python ≥ 3.10 required** (uses `str | None` union syntax).
-- **No pytest/conftest** — tests are standalone scripts with manual assertions and print-based output. Add new tests as new scripts in `tests/`.
+- **No pytest/conftest** — new regression tests use `unittest` and must remain directly runnable from `tests/`.
 - **Rate limiting**: `proofreader.RateLimiter` uses `asyncio.Lock` with RPM-based intervals. Concurrency and RPM are separate knobs — `--concurrent N` controls simultaneous API calls, `--rpm N` controls the per-minute cap.

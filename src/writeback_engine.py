@@ -29,11 +29,13 @@ import argparse
 import glob
 import json
 import os
+import posixpath
 import re
 import sys
 import zipfile
 from copy import deepcopy
 from datetime import datetime, timezone
+from pathlib import Path
 from lxml import etree
 
 # ── OOXML namespaces ──────────────────────────────────────────────────────
@@ -72,6 +74,8 @@ MTF_CHANGED_SPAN_CAP = 30   # 原文被改最大字数
 MTF_RETENTION_FLOOR = 0.35   # 字 bigram 保留下限
 MTF_SHORT_RETENTION = 0.10   # 短 replacement（≤4字符）的保留下限，防过度阻挡小幅修正
 MTF_SHORT_SKIP_GATE = 2      # 单字修改（changed_span ≤2）跳过振幅门禁——1字修正（如「查→茬」）bigram 保留恒为0
+MTF_SHORT_ADDED_CAP = 4      # 短 replacement 最多新增字符，防短锚点被扩写成整句
+MTF_ADDED_SPAN_CAP = 30      # 一次修订允许新增的最大字符数
 MTF_BOUNDARY_CAP = 1         # 最大允许句界变化数
 # 以上为本项目标定占位，勿跨语料照搬
 
@@ -193,17 +197,16 @@ def normalize_text(s):
     return s
 
 def _find_para(para_map, text_map, pn, anchor):
-    """Find the paragraph containing `anchor`. Try exact P-number first, then full search."""
-    # 1: exact P-number
+    """Find ``anchor`` only in its declared body paragraph.
+
+    P numbers are part of the writeback contract. Silently searching another
+    paragraph can apply a valid correction to the wrong repeated sentence.
+    """
     p = para_map.get(pn)
     if p is not None:
         txt = text_map.get(pn, '')
-        if txt and anchor in txt:
+        if txt and (anchor in txt or normalize_text(anchor) in normalize_text(txt)):
             return p, txt
-    # 2: fallback -- search all paragraphs
-    for opn, txt in text_map.items():
-        if anchor in txt or (normalize_text(anchor) in normalize_text(txt)):
-            return para_map[opn], txt
     return None, None
 
 
@@ -282,7 +285,11 @@ def measure_mtf(cur, sug):
     from difflib import SequenceMatcher
     sm = SequenceMatcher(None, cur, sug, autojunk=False)
     changed = added = 0
-    retained = sum(i2 - i1 for _, i1, i2, _, _ in sm.get_opcodes() if _ == 'equal')
+    retained = sum(
+        i2 - i1
+        for tag, i1, i2, _j1, _j2 in sm.get_opcodes()
+        if tag == 'equal'
+    )
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag in ('delete', 'replace'):
             changed += i2 - i1
@@ -298,39 +305,18 @@ def measure_mtf(cur, sug):
             'boundary_delta': bd, 'len_cur': len(cur), 'len_sug': len(sug)}
 
 
-def _copy_rpr(src_run, dst_run):
-    """Copy <w:rPr> from src_run to dst_run (both <w:r> elements), stripping annotation-only elements."""
-    src_rpr = src_run.find(qn('rPr'))
-    if src_rpr is None:
-        return
-    existing = dst_run.find(qn('rPr'))
-    if existing is not None:
-        dst_run.remove(existing)
-    dst_rpr = deepcopy(src_rpr)
-    # Remove annotation-only + revision-metadata children (copied into del/ins
-    # would create nested OOXML that Word renders incorrectly or silently drops)
-    strips = {'highlight', 'commentReference', 'commentRangeStart', 'commentRangeEnd',
-              'moveFrom', 'moveTo', 'moveFromRangeStart', 'moveFromRangeEnd',
-              'moveToRangeStart', 'moveToRangeEnd', 'rPrChange', 'bookmarkStart',
-              'bookmarkEnd'}
-    for child in list(dst_rpr):
-        tag = child.tag.rsplit('}', 1)[-1]
-        if tag in strips:
-            dst_rpr.remove(child)
-    dst_run.insert(0, dst_rpr)
-
-
-def _strip_highlight(run_or_elem):
-    """Remove <w:highlight> from a run element's rPr (or the first run inside an element)."""
-    if run_or_elem is None:
-        return
-    r = run_or_elem if run_or_elem.find(qn('r')) is None else run_or_elem.find(qn('r'))
-    rpr = r.find(qn('rPr')) if r is not None else None
-    if rpr is None:
-        return
-    hl = rpr.find(qn('highlight'))
-    if hl is not None:
-        rpr.remove(hl)
+def _expected_revision_delta(current, suggested):
+    """Return the exact deleted and inserted payload expected in OOXML."""
+    from difflib import SequenceMatcher
+    deleted = []
+    inserted = []
+    for tag, i1, i2, j1, j2 in SequenceMatcher(
+            None, current, suggested, autojunk=False).get_opcodes():
+        if tag in ('delete', 'replace'):
+            deleted.append(current[i1:i2])
+        if tag in ('insert', 'replace'):
+            inserted.append(suggested[j1:j2])
+    return ''.join(deleted), ''.join(inserted)
 
 
 # ── Track changes helpers ─────────────────────────────────────────────────
@@ -361,197 +347,197 @@ def _author_iso(author):
     return author, now.strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
-def _ensure_run_rpr(para):
-    """Return a default rPr element (<w:rPr><w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman"/><w:lang w:val="en-US" w:eastAsia="zh-CN"/></w:rPr>)"""
-    rpr = etree.SubElement(para, qn('rPr')) if para.find(qn('rPr')) is None else para.find(qn('rPr'))
-    return rpr
+def _plain_run_text(run):
+    """Return text for an editable plain run, otherwise ``None``.
 
-
-def _make_run(para, text, rpr_attrs=None):
-    """Create <w:r><w:rPr>…</w:rPr><w:t>text</w:t></w:r> with optional rPr.
-
-    rpr_attrs: dict with keys 'sz', 'color', 'b', 'i', etc. for w:rPr children.
+    Tracked changes must not flatten fields, drawings, tabs, hyperlinks, or
+    pre-existing revisions. Only a direct paragraph run with one text node and
+    optional run properties is safe to split.
     """
-    r = etree.SubElement(para, qn('r'))
-    if rpr_attrs:
-        rpr = etree.SubElement(r, qn('rPr'))
-        for k, v in rpr_attrs.items():
-            etree.SubElement(rpr, qn(k), attrib=v if isinstance(v, dict) else {qn(k): v})
-    t = etree.SubElement(r, qn('t'))
-    t.text = text
-    t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-    return r
+    if run.tag != qn('r'):
+        return None
+    children = list(run)
+    if any(child.tag not in (qn('rPr'), qn('t')) for child in children):
+        return None
+    texts = [child for child in children if child.tag == qn('t')]
+    if len(texts) != 1:
+        return None
+    return texts[0].text or ''
+
+
+def _clone_text_run(run, text, deleted=False, highlight=None):
+    """Clone a plain run while replacing only its text payload."""
+    clone = deepcopy(run)
+    for child in list(clone):
+        if child.tag != qn('rPr'):
+            clone.remove(child)
+    text_el = etree.SubElement(clone, qn('delText') if deleted else qn('t'))
+    text_el.text = text
+    text_el.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+    rpr = clone.find(qn('rPr'))
+    if highlight is not None:
+        if rpr is None:
+            rpr = etree.Element(qn('rPr'))
+            clone.insert(0, rpr)
+        old = rpr.find(qn('highlight'))
+        if old is not None:
+            rpr.remove(old)
+        if highlight:
+            etree.SubElement(rpr, qn('highlight')).set(qn('val'), highlight)
+    return clone
+
+
+def _safe_text_stream(para):
+    """Build a text stream and direct-run intervals without crossing unsafe OOXML."""
+    stream = ''
+    intervals = []
+    field_depth = 0
+    for child in para:
+        field_types = [
+            node.get(qn('fldCharType'))
+            for node in child.iter(qn('fldChar'))
+        ]
+        field_depth += sum(1 for value in field_types if value == 'begin')
+        text = _plain_run_text(child)
+        if text is not None and field_depth == 0:
+            start = len(stream)
+            stream += text
+            intervals.append((start, len(stream), child, text))
+        else:
+            # Every non-plain child is a hard boundary, including zero-width
+            # bookmarks/comment markers, field results, and runs containing
+            # tabs or drawings. Never move such OOXML across a replacement.
+            stream += '\ufff0'
+        field_depth = max(
+            0, field_depth
+            - sum(1 for value in field_types if value == 'end'))
+    return stream, intervals
+
+
+def _locate_safe_span(para, current):
+    """Locate a unique target fully contained in editable direct runs."""
+    if not current:
+        return None, 'empty target'
+    accepted = _para_raw_text(para)
+    if accepted.count(current) != 1:
+        return None, 'anchor is missing or ambiguous in paragraph'
+    if para.find('.//' + qn('permStart')) is not None:
+        return None, 'paragraph contains a protected range'
+    stream, intervals = _safe_text_stream(para)
+    if stream.count(current) != 1:
+        return None, 'anchor crosses a hyperlink, field, or existing revision'
+    start = stream.find(current)
+    end = start + len(current)
+    affected = [item for item in intervals if item[0] < end and item[1] > start]
+    if not affected or affected[0][0] > start or affected[-1][1] < end:
+        return None, 'anchor crosses an unsafe run boundary'
+    return (start, end, intervals, affected), None
+
+
+def _source_run_pieces(intervals, start, end):
+    pieces = []
+    for run_start, run_end, run, text in intervals:
+        left = max(start, run_start)
+        right = min(end, run_end)
+        if left < right:
+            pieces.append((run, text[left - run_start:right - run_start]))
+    return pieces
+
+
+def _revision_element(tag, rid, author, date_iso, pieces, inserted_text=''):
+    revision = etree.Element(qn(tag))
+    revision.set(qn('id'), str(rid))
+    revision.set(qn('author'), author)
+    revision.set(qn('date'), date_iso)
+    if tag == 'del':
+        for run, text in pieces:
+            revision.append(_clone_text_run(run, text, deleted=True, highlight=False))
+    elif inserted_text:
+        template = pieces[0][0]
+        revision.append(_clone_text_run(
+            template, inserted_text, deleted=False, highlight='yellow'))
+    return revision
 
 
 def apply_track_change(para, current, suggested, rid, author, date_iso):
-    """Apply character-precise tracked change using difflib minimal diff.
-
-    v3: preserves text outside the error span by truncating boundary runs
-    instead of removing them. Never creates after_run clones (diff output
-    covers the entire current span).
-    """
-    runs = para.findall(qn('r'))
-    if not runs:
+    """Apply one tracked change while preserving all unrelated OOXML nodes."""
+    located, conflict = _locate_safe_span(para, current)
+    if located is None:
+        print(f'  WARN: track change downgraded: {conflict}: "{current[:40]}"')
         return False
-    parent = para
-    joined = ''
-    intervals = []
-    for r in runs:
-        t_el = r.find(qn('t'))
-        txt = t_el.text or '' if t_el is not None else ''
-        intervals.append((len(joined), len(joined) + len(txt), r, t_el))
-        joined += txt
-    cpos = joined.find(current)
-    if cpos < 0:
-        jn = normalize_text(joined)
-        cn = normalize_text(current)
-        cpos = jn.find(cn)
-        if cpos >= 0:
-            ri = 0; ni = 0
-            while ni < cpos and ri < len(joined):
-                if not joined[ri].isspace():
-                    ni += 1
-                ri += 1
-            cpos = ri
-        else:
-            print('  WARN: anchor not found: "' + current[:40] + '"')
-            return False
-    c_end = cpos + len(current)
+    cpos, c_end, intervals, affected = located
+    first_start, _, first_run, first_text = affected[0]
+    _, last_end, last_run, last_text = affected[-1]
+    replacements = []
 
-    # Find overlapping runs
-    ai = [i for i, (s, e, r, t) in enumerate(intervals) if s < c_end and e > cpos]
-    if not ai:
-        print('  WARN: anchor span empty: "' + current[:40] + '"')
-        return False
+    prefix = first_text[:cpos - first_start]
+    if prefix:
+        replacements.append(_clone_text_run(first_run, prefix))
 
-    first_idx, last_idx = ai[0], ai[-1]
-
-    # ── Split first run: truncate text before cpos, keep it ──
-    first_s, first_e, first_run, first_t = intervals[first_idx]
-    if first_s < cpos and first_t is not None and first_t.text:
-        before_len = cpos - first_s
-        first_t.text = first_t.text[:before_len]
-
-    # ── Split last run: keep text after c_end, truncate original ──
-    last_s, last_e, last_run, last_t = intervals[last_idx]
-    needs_after_tail = False
-    after_tail_text = ''
-    if last_e > c_end and last_t is not None and last_t.text:
-        after_start = c_end - last_s
-        if 0 < after_start < len(last_t.text):
-            after_tail_text = last_t.text[after_start:]
-            last_t.text = last_t.text[:after_start]
-            needs_after_tail = True
-
-    # ── Build diff elements ──
     from difflib import SequenceMatcher
     sm = SequenceMatcher(None, current, suggested, autojunk=False)
-    new_elements = []
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        cp = current[i1:i2]
-        sp = suggested[j1:j2]
-
-        if tag == 'equal' and cp:
-            clone = deepcopy(first_run)
-            ct = clone.find(qn('t'))
-            if ct is not None:
-                ct.text = cp
-            _strip_highlight(clone)
-            new_elements.append(clone)
-
-        elif tag == 'delete' and cp:
-            del_el = etree.Element(qn('del'))
-            del_el.set(qn('id'), str(rid))
-            del_el.set(qn('author'), author)
-            del_el.set(qn('date'), date_iso)
-            dr = etree.SubElement(del_el, qn('r'))
-            _copy_rpr(first_run, dr)
-            dt = etree.SubElement(dr, qn('delText'))
-            dt.text = cp
-            dt.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-            new_elements.append(del_el)
-
-        elif tag == 'insert' and sp:
-            ins_el = etree.Element(qn('ins'))
-            ins_el.set(qn('id'), str(rid))
-            ins_el.set(qn('author'), author)
-            ins_el.set(qn('date'), date_iso)
-            ir = etree.SubElement(ins_el, qn('r'))
-            _copy_rpr(first_run, ir)
-            irp = ir.find(qn('rPr'))
-            if irp is None:
-                irp = etree.SubElement(ir, qn('rPr'))
-            if irp.find(qn('highlight')) is None:
-                etree.SubElement(irp, qn('highlight')).set(qn('val'), 'yellow')
-            it = etree.SubElement(ir, qn('t'))
-            it.text = sp
-            it.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-            new_elements.append(ins_el)
-
+        pieces = _source_run_pieces(intervals, cpos + i1, cpos + i2)
+        if tag == 'equal':
+            for run, text in pieces:
+                replacements.append(_clone_text_run(run, text))
+        elif tag == 'delete':
+            replacements.append(_revision_element(
+                'del', rid, author, date_iso, pieces))
+        elif tag == 'insert':
+            style_pieces = _source_run_pieces(
+                intervals, cpos + max(0, i1 - 1), cpos + max(1, i1))
+            style_pieces = style_pieces or [(first_run, '')]
+            replacements.append(_revision_element(
+                'ins', rid, author, date_iso, style_pieces,
+                inserted_text=suggested[j1:j2]))
         elif tag == 'replace':
-            if cp:
-                del_el = etree.Element(qn('del'))
-                del_el.set(qn('id'), str(rid))
-                del_el.set(qn('author'), author)
-                del_el.set(qn('date'), date_iso)
-                dr = etree.SubElement(del_el, qn('r'))
-                _copy_rpr(first_run, dr)
-                dt = etree.SubElement(dr, qn('delText'))
-                dt.text = cp
-                dt.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-                new_elements.append(del_el)
-            if sp:
-                ins_el = etree.Element(qn('ins'))
-                ins_el.set(qn('id'), str(rid))
-                ins_el.set(qn('author'), author)
-                ins_el.set(qn('date'), date_iso)
-                ir = etree.SubElement(ins_el, qn('r'))
-                _copy_rpr(first_run, ir)
-                irp = ir.find(qn('rPr'))
-                if irp is None:
-                    irp = etree.SubElement(ir, qn('rPr'))
-                if irp.find(qn('highlight')) is None:
-                    etree.SubElement(irp, qn('highlight')).set(qn('val'), 'yellow')
-                it = etree.SubElement(ir, qn('t'))
-                it.text = sp
-                it.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-                new_elements.append(ins_el)
+            replacements.append(_revision_element(
+                'del', rid, author, date_iso, pieces))
+            replacements.append(_revision_element(
+                'ins', rid, author, date_iso, pieces or [(first_run, '')],
+                inserted_text=suggested[j1:j2]))
 
-    # Remove runs fully inside the error span
-    runs_to_remove = [i for i in ai
-                      if intervals[i][0] >= cpos and intervals[i][1] <= c_end]
-    for i in reversed(sorted(set(runs_to_remove))):
-        try:
-            parent.remove(runs[i])
-        except (ValueError, IndexError):
-            pass
+    suffix = last_text[len(last_text) - (last_end - c_end):] if last_end > c_end else ''
+    if suffix:
+        replacements.append(_clone_text_run(last_run, suffix))
 
-    # Find a valid insertion point: use the first non-removed overlapping run,
-    # or fall back to runs outside the span, or append to parent end.
-    insert_ref = None
-    # Try remaining runs in order: first non-removed from ai, then first run before ai, then append
-    for candidate_idx in (first_idx, 0):
-        if candidate_idx < len(runs) and runs[candidate_idx].getparent() is parent:
-            insert_ref = runs[candidate_idx]
-            break
-    if insert_ref is not None:
-        insert_idx = list(parent).index(insert_ref)
-        for el in new_elements:
-            parent.insert(insert_idx, el)
-            insert_idx += 1
-    else:
-        for el in new_elements:
-            parent.append(el)
-
-    # Append the after-tail text as a plain run (if any)
-    if needs_after_tail and after_tail_text:
-        tail_run = deepcopy(last_run)
-        tail_t = tail_run.find(qn('t'))
-        if tail_t is not None:
-            tail_t.text = after_tail_text
-        parent.append(tail_run)
+    insert_at = list(para).index(first_run)
+    for _, _, run, _ in affected:
+        para.remove(run)
+    for element in replacements:
+        para.insert(insert_at, element)
+        insert_at += 1
 
     return True
+
+
+def _comment_reference_run(cmt_id):
+    run = etree.Element(qn('r'))
+    rpr = etree.SubElement(run, qn('rPr'))
+    style = etree.SubElement(rpr, qn('rStyle'))
+    style.set(qn('val'), 'CommentReference')
+    cref = etree.SubElement(run, qn('commentReference'))
+    cref.set(qn('id'), str(cmt_id))
+    return run
+
+
+def _highlight_run(run):
+    rpr = run.find(qn('rPr'))
+    if rpr is None:
+        rpr = etree.Element(qn('rPr'))
+        run.insert(0, rpr)
+    highlight = rpr.find(qn('highlight'))
+    if highlight is None:
+        highlight = etree.SubElement(rpr, qn('highlight'))
+    highlight.set(qn('val'), 'yellow')
+
+
+def _top_level_child(para, node):
+    while node is not None and node.getparent() is not para:
+        node = node.getparent()
+    return node
+
 
 def apply_annotation(para, current, fix_class, rid, author, date_iso, suggested='', reason='', description='', category=''):
     """Apply yellow highlight + comment to `current` in the paragraph.
@@ -560,71 +546,70 @@ def apply_annotation(para, current, fix_class, rid, author, date_iso, suggested=
     commentRangeStart before the first affected run and
     commentRangeEnd + commentReference after the last affected run.
     """
-    runs = para.findall(qn('r'))
-    if not runs:
-        return False
-
-    joined = ''
-    run_info = []  # (start, end, run, t_element)
-    for i, r in enumerate(runs):
-        t_el = r.find(qn('t'))
-        txt = t_el.text or '' if t_el is not None else ''
-        run_info.append((len(joined), len(joined) + len(txt), r, t_el))
-        joined += txt
-
-    cpos = joined.find(current)
-    if cpos < 0:
-        joined_norm = normalize_text(joined)
-        cur_norm = normalize_text(current)
-        cpos = joined_norm.find(cur_norm)
-        if cpos >= 0:
-            raw_idx = 0
-            norm_idx = 0
-            while norm_idx < cpos and raw_idx < len(joined):
-                if not joined[raw_idx].isspace():
-                    norm_idx += 1
-                raw_idx += 1
-            cpos = raw_idx
-        else:
-            print(f'  WARN (annotate): "{current[:40]}" not found')
+    located, _ = _locate_safe_span(para, current)
+    cmt_id = rid
+    if located is not None:
+        cpos, c_end, intervals, affected = located
+        first_start, _, first_run, first_text = affected[0]
+        _, last_end, last_run, last_text = affected[-1]
+        replacements = []
+        prefix = first_text[:cpos - first_start]
+        if prefix:
+            replacements.append(_clone_text_run(first_run, prefix))
+        highlighted = []
+        for run, text in _source_run_pieces(intervals, cpos, c_end):
+            clone = _clone_text_run(run, text, highlight='yellow')
+            replacements.append(clone)
+            highlighted.append(clone)
+        suffix = last_text[len(last_text) - (last_end - c_end):] if last_end > c_end else ''
+        if suffix:
+            replacements.append(_clone_text_run(last_run, suffix))
+        insert_at = list(para).index(first_run)
+        for _, _, run, _ in affected:
+            para.remove(run)
+        for element in replacements:
+            para.insert(insert_at, element)
+            insert_at += 1
+        first_anchor = highlighted[0]
+        last_anchor = highlighted[-1]
+    else:
+        # Annotation-only fallback for hyperlinks, fields, protected ranges, and
+        # existing revisions. The nested structure remains byte-for-byte intact.
+        accepted = _para_raw_text(para)
+        if accepted.count(current) != 1:
+            print(f'  WARN (annotate): "{current[:40]}" missing or ambiguous')
+            return False
+        cpos = accepted.find(current)
+        c_end = cpos + len(current)
+        joined = ''
+        run_info = []
+        for run in para.iter(qn('r')):
+            if any(a.tag == qn('del') for a in run.iterancestors()):
+                continue
+            text = ''.join(t.text or '' for t in run.iter(qn('t')))
+            if not text:
+                continue
+            run_info.append((len(joined), len(joined) + len(text), run))
+            joined += text
+        affected_runs = [run for start, end, run in run_info
+                         if start < c_end and end > cpos]
+        if not affected_runs:
+            return False
+        for run in affected_runs:
+            _highlight_run(run)
+        first_anchor = _top_level_child(para, affected_runs[0])
+        last_anchor = _top_level_child(para, affected_runs[-1])
+        if first_anchor is None or last_anchor is None:
             return False
 
-    c_end = cpos + len(current)
-    affected = [i for i, (s, e, r, t) in enumerate(run_info) if s < c_end and e > cpos]
-    if not affected:
-        return False
-
-    first_idx, last_idx = affected[0], affected[-1]
-    first_run = run_info[first_idx][2]
-    last_run = run_info[last_idx][2]
-    parent = first_run.getparent()
-    cmt_id = rid
-
-    # Add highlight to affected runs
-    for idx in affected:
-        s, e, r, t_el = run_info[idx]
-        rpr = r.find(qn('rPr'))
-        if rpr is None:
-            rpr = etree.SubElement(r, qn('rPr'))
-        # Only add highlight if not already there
-        if rpr.find(qn('highlight')) is None:
-            etree.SubElement(rpr, qn('highlight')).set(qn('val'), 'yellow')
-
-    # commentRangeStart — before first affected run
     crs = etree.Element(qn('commentRangeStart'))
     crs.set(qn('id'), str(cmt_id))
-    parent.insert(list(parent).index(first_run), crs)
-
-    # commentRangeEnd — after last affected run
+    para.insert(list(para).index(first_anchor), crs)
     cre = etree.Element(qn('commentRangeEnd'))
     cre.set(qn('id'), str(cmt_id))
-    last_idx_in_parent = list(parent).index(last_run)
-    parent.insert(last_idx_in_parent + 1, cre)
-
-    # commentReference — after commentRangeEnd
-    cref = etree.Element(qn('commentReference'))
-    cref.set(qn('id'), str(cmt_id))
-    parent.insert(last_idx_in_parent + 2, cref)
+    last_idx_in_parent = list(para).index(last_anchor)
+    para.insert(last_idx_in_parent + 1, cre)
+    para.insert(last_idx_in_parent + 2, _comment_reference_run(cmt_id))
 
     return cmt_id, category, fix_class, current, suggested, reason, description
 
@@ -738,24 +723,37 @@ def _inject_comment_styles(styles_root):
     return styles_root
 
 
-def _map_comment_para_ids(doc_xml):
-    """扫描 doc_xml 中 w:commentRangeStart 建立 cmt_id → 段落 w14:paraId 映射。"""
-    mapping = {}
-    for crs in doc_xml.iter(qn('commentRangeStart')):
-        cmt_id = crs.get(qn('id'))
-        if cmt_id is None:
-            continue
-        p = crs.getparent()
-        while p is not None and p.tag != qn('p'):
-            p = p.getparent()
-        if p is not None:
-            para_id = p.get(f'{{{W14}}}paraId')
-            if para_id:
-                mapping[cmt_id] = para_id
+def _ensure_comment_para_ids(comments_xml):
+    """Ensure every comment has a paragraph id used by commentsExtended.xml."""
+    used = {
+        value.upper()
+        for p in comments_xml.iter(qn('p'))
+        for value in [p.get(f'{{{W14}}}paraId')]
+        if value
+    }
+    mapping = []
+    next_id = 1
+    for comment in comments_xml.iter(qn('comment')):
+        para = comment.find(qn('p'))
+        if para is None:
+            para = etree.SubElement(comment, qn('p'))
+        para_id = para.get(f'{{{W14}}}paraId')
+        if not para_id:
+            while f'{next_id:08X}' in used:
+                next_id += 1
+            para_id = f'{next_id:08X}'
+            next_id += 1
+            para.set(f'{{{W14}}}paraId', para_id)
+            para.set(f'{{{W14}}}textId', '77777777')
+            used.add(para_id)
+        mapping.append(para_id)
+    ignorable = comments_xml.get(mcn('Ignorable'), '').split()
+    if 'w14' not in ignorable:
+        comments_xml.set(mcn('Ignorable'), ' '.join(ignorable + ['w14']).strip())
     return mapping
 
 
-def _build_comments_extended(cmt_id_para_map):
+def _build_comments_extended(comment_para_ids):
     """构建 <w15:commentsEx> — WPS 通过此文件将批注锚定到段落。
 
     标准批注文件使用 w15: namespace (Word 2012/2013+) 而非 w14:。
@@ -763,14 +761,184 @@ def _build_comments_extended(cmt_id_para_map):
     不含 paraIdCommentId（标准版文件无此属性）。
     """
     root = etree.Element(f'{{{W15}}}commentsEx')
-    for cmt_id in sorted(cmt_id_para_map.keys(), key=int):
+    for para_id in comment_para_ids:
         ex = etree.SubElement(root, f'{{{W15}}}commentEx')
-        ex.set(f'{{{W15}}}paraId', cmt_id_para_map[cmt_id])
+        ex.set(f'{{{W15}}}paraId', para_id)
         ex.set(f'{{{W15}}}done', '0')
     return root
 
 
 # ── altChunk 转换 ────────────────────────────────────────────────────────
+
+class DocxAuditError(ValueError):
+    """Raised when a generated DOCX package is not internally consistent."""
+
+
+def _relationship_part(rel_path):
+    if rel_path == '_rels/.rels':
+        return ''
+    marker = '/_rels/'
+    if marker not in rel_path or not rel_path.endswith('.rels'):
+        return ''
+    prefix, name = rel_path.split(marker, 1)
+    return posixpath.join(prefix, name[:-5])
+
+
+def audit_docx(path, expected_comment_ids=None, expected_author=None,
+               require_revisions=False, expected_revisions=None):
+    """Audit the package graph and OOXML emitted by this engine."""
+    expected_comment_ids = {str(i) for i in (expected_comment_ids or [])}
+    expected_revisions = expected_revisions or []
+    errors = []
+    with zipfile.ZipFile(path, 'r') as package:
+        bad = package.testzip()
+        if bad:
+            errors.append(f'corrupt ZIP member: {bad}')
+        names = set(package.namelist())
+        if 'word/document.xml' not in names:
+            raise DocxAuditError('missing word/document.xml')
+
+        for xml_path in (name for name in names
+                         if name.endswith('.xml') or name.endswith('.rels')):
+            try:
+                etree.fromstring(package.read(xml_path))
+            except etree.XMLSyntaxError as exc:
+                errors.append(f'invalid XML part {xml_path}: {exc}')
+
+        for rel_path in (name for name in names if name.endswith('.rels')):
+            try:
+                rels = etree.fromstring(package.read(rel_path))
+            except etree.XMLSyntaxError as exc:
+                errors.append(f'invalid relationships XML {rel_path}: {exc}')
+                continue
+            owner = _relationship_part(rel_path)
+            base = posixpath.dirname(owner)
+            for rel in rels:
+                target = rel.get('Target', '')
+                if (rel.get('TargetMode') == 'External' or not target
+                        or '://' in target):
+                    continue
+                resolved = (target.lstrip('/') if target.startswith('/') else
+                            posixpath.normpath(posixpath.join(base, target)))
+                if resolved not in names:
+                    errors.append(f'dangling relationship {rel_path} -> {target}')
+
+        content_types = etree.fromstring(package.read('[Content_Types].xml'))
+        overrides = {child.get('PartName') for child in content_types
+                     if child.tag.endswith('Override')}
+        document_targets = set()
+        if 'word/_rels/document.xml.rels' in names:
+            document_rels = etree.fromstring(
+                package.read('word/_rels/document.xml.rels'))
+            for rel in document_rels:
+                if rel.get('TargetMode') == 'External':
+                    continue
+                target = rel.get('Target', '')
+                document_targets.add(
+                    target.lstrip('/') if target.startswith('/') else
+                    posixpath.normpath(posixpath.join('word', target)))
+        for part in ('word/comments.xml', 'word/commentsExtended.xml'):
+            if part not in names:
+                continue
+            if f'/{part}' not in overrides:
+                errors.append(f'missing Content Type override for {part}')
+            if part not in document_targets:
+                errors.append(f'missing document relationship for {part}')
+
+        doc = etree.fromstring(package.read('word/document.xml'))
+        comments = None
+        comment_ids = set()
+        if 'word/comments.xml' in names:
+            comments = etree.fromstring(package.read('word/comments.xml'))
+            comment_ids = {
+                str(comment.get(qn('id')))
+                for comment in comments.iter(qn('comment'))
+            }
+
+        starts = [str(node.get(qn('id'))) for node in doc.iter(qn('commentRangeStart'))]
+        ends = [str(node.get(qn('id'))) for node in doc.iter(qn('commentRangeEnd'))]
+        refs = list(doc.iter(qn('commentReference')))
+        ref_ids = [str(node.get(qn('id'))) for node in refs]
+        for cmt_id in expected_comment_ids:
+            if starts.count(cmt_id) != 1 or ends.count(cmt_id) != 1 or ref_ids.count(cmt_id) != 1:
+                errors.append(f'unpaired comment anchor id={cmt_id}')
+            if cmt_id not in comment_ids:
+                errors.append(f'missing comment body id={cmt_id}')
+        for ref in refs:
+            if str(ref.get(qn('id'))) not in expected_comment_ids:
+                continue
+            run = ref.getparent()
+            style = run.find(qn('rPr') + '/' + qn('rStyle')) if run is not None else None
+            if (run is None or run.tag != qn('r') or style is None
+                    or style.get(qn('val')) != 'CommentReference'):
+                errors.append(f'commentReference id={ref.get(qn("id"))} is not in a styled run')
+
+        if 'word/commentsExtended.xml' in names:
+            extended = etree.fromstring(package.read('word/commentsExtended.xml'))
+            ext_ids = {
+                item.get(f'{{{W15}}}paraId')
+                for item in extended.iter(f'{{{W15}}}commentEx')
+            }
+            para_ids = {
+                p.get(f'{{{W14}}}paraId')
+                for p in (comments.iter(qn('p')) if comments is not None else [])
+            }
+            if any(value and value not in para_ids for value in ext_ids):
+                errors.append('commentsExtended references unknown comment paragraphs')
+            expected_para_ids = {
+                comment.find(qn('p')).get(f'{{{W14}}}paraId')
+                for comment in comments.iter(qn('comment'))
+                if (str(comment.get(qn('id'))) in expected_comment_ids
+                    and comment.find(qn('p')) is not None)
+            } if comments is not None else set()
+            if any(value not in ext_ids for value in expected_para_ids if value):
+                errors.append('commentsExtended is missing a generated comment paragraph')
+
+        revisions = list(doc.iter(qn('ins'))) + list(doc.iter(qn('del')))
+        authored = [node for node in revisions
+                    if not expected_author or node.get(qn('author')) == expected_author]
+        if require_revisions and not authored:
+            errors.append('expected tracked revisions were not written')
+        for node in authored:
+            if not node.get(qn('id')) or not node.get(qn('author')) or not node.get(qn('date')):
+                errors.append('tracked revision is missing id/author/date metadata')
+        for rev_id, expected_deleted, expected_inserted in expected_revisions:
+            deleted = ''.join(
+                text.text or ''
+                for node in doc.iter(qn('del'))
+                if str(node.get(qn('id'))) == str(rev_id)
+                for text in node.iter(qn('delText'))
+            )
+            inserted = ''.join(
+                text.text or ''
+                for node in doc.iter(qn('ins'))
+                if str(node.get(qn('id'))) == str(rev_id)
+                for text in node.iter(qn('t'))
+            )
+            if deleted != expected_deleted or inserted != expected_inserted:
+                errors.append(
+                    f'revision text mismatch id={rev_id}: '
+                    f'del={deleted!r}/{expected_deleted!r}, '
+                    f'ins={inserted!r}/{expected_inserted!r}')
+
+    if errors:
+        raise DocxAuditError('; '.join(errors))
+    return {
+        'comments': len(expected_comment_ids),
+        'revisions': len(authored),
+        'relationships': 'ok',
+    }
+
+
+def _next_relationship_id(rels_xml, prefix):
+    used = {rel.get('Id') for rel in rels_xml}
+    if prefix not in used:
+        return prefix
+    number = 2
+    while f'{prefix}{number}' in used:
+        number += 1
+    return f'{prefix}{number}'
+
 
 def _convert_altchunk_to_paras(z, docx_path, doc_xml, body):
     """Convert altChunk (MHT/HTML embedded content) to standard w:p paragraphs.
@@ -886,6 +1054,9 @@ def main():
                   and not any(t in f for t in ('-批注', '-参考', '标准版', '修改版'))]
     # 选长度最短且排序最前的原始文件（排除附加词汇后的变体）
     candidates.sort(key=lambda x: (len(os.path.basename(x)), x))
+    if not candidates:
+        print(f'ERROR: no source DOCX matching {stem!r} in {parent}', file=sys.stderr)
+        sys.exit(1)
     docx_path = candidates[0]
     # 记录选中文件用于诊断
     print(f'源文档: {os.path.basename(docx_path)}')
@@ -949,6 +1120,7 @@ def main():
 
     # ── shared comment entries pool (both must_fix and annotations append here) ──
     COMMENT_ENTRIES = []  # (cmt_id, author, date_iso, title, suggestion, evidence)
+    EXPECTED_REVISIONS = []  # (revision id, deleted payload, inserted payload)
 
     # ── apply must_fix: annotation first, then track change (with amplitude gate) ──
     # 批次处理：先定位所有 findings 的段落和位置，按段落后→前排序分批
@@ -960,8 +1132,8 @@ def main():
     must_ann_done = 0
     must_ann_fail = 0
 
-    # 先为每条 finding 预计算 text position（不修改段落）
-    # 同一段落的多条 finding 做位置预排
+    # Locate against the unmodified accepted view, then process each paragraph
+    # from back to front so a later edit cannot shift an earlier anchor.
     pre_located = []  # [(p_el, cpos, current, suggested, fix_class, ...)]
     for fd in must_fix:
         p, txt = _find_para(para_map, text_map, fd['pn'], fd['current'])
@@ -972,28 +1144,12 @@ def main():
             print(f'  WARN: anchor "{fd["current"][:30]}" not found (even after full search)')
             continue
 
-        # 在原始文本中找位置
-        joined = ''
-        for r in p.findall(qn('r')):
-            t_el = r.find(qn('t'))
-            txt = t_el.text or '' if t_el is not None else ''
-            joined += txt
-        cpos = joined.find(fd['current'])
-        if cpos < 0:
-            jn = normalize_text(joined)
-            cn = normalize_text(fd['current'])
-            cpos2 = jn.find(cn)
-            if cpos2 >= 0:
-                ri = 0; ni = 0
-                while ni < cpos2 and ri < len(joined):
-                    if not joined[ri].isspace():
-                        ni += 1
-                    ri += 1
-                cpos = ri
-            else:
-                track_fail += 1
-                print(f'  WARN: cannot pre-locate anchor "{fd["current"][:30]}"')
-                continue
+        accepted = _para_raw_text(p)
+        if accepted.count(fd['current']) != 1:
+            track_fail += 1
+            print(f'  WARN: anchor "{fd["current"][:30]}" missing or ambiguous')
+            continue
+        cpos = accepted.find(fd['current'])
 
         pre_located.append((p, cpos, fd['current'], fd['suggested'],
                            fd.get('fix_class', 'must_fix'),
@@ -1007,172 +1163,85 @@ def main():
         para_groups.setdefault(pid, {'para': pl[0], 'findings': []})
         para_groups[pid]['findings'].append(pl)
 
-    # 遍历段落组，每个段落做 annotations + 合并 tracked changes
-    for gid, g in para_groups.items():
-        # 段内从后往前排序（位置大的先处理）
+    # Apply each finding locally; never rebuild the paragraph's complete run
+    # list. Unsafe OOXML targets remain untouched and receive a comment only.
+    for g in para_groups.values():
         g['findings'].sort(key=lambda x: x[1], reverse=True)
-        p = g['para']
-        findings_list = g['findings']
-
-        # Step 1: Apply all annotations (don't affect text structure)
-        for pl in findings_list:
+        for pl in g['findings']:
             p_el, cpos, cur, sug, fc, reason, cat, desc, pn = pl
+            met = measure_mtf(cur, sug)
+            min_ret = MTF_SHORT_RETENTION if met['changed_span'] <= 4 else MTF_RETENTION_FLOOR
+            budget_ok = (
+                (
+                    met['changed_span'] <= MTF_SHORT_SKIP_GATE
+                    and met['added'] <= MTF_SHORT_ADDED_CAP
+                    and abs(met['len_sug'] - met['len_cur']) <= MTF_SHORT_ADDED_CAP
+                )
+                or (
+                    met['changed_span'] <= MTF_CHANGED_SPAN_CAP
+                    and met['added'] <= MTF_ADDED_SPAN_CAP
+                    and met['retention'] >= min_ret
+                    and met['boundary_delta'] <= MTF_BOUNDARY_CAP
+                )
+            )
+            _, conflict = _locate_safe_span(p_el, cur)
+            will_track = budget_ok and conflict is None and cur != sug
+            downgrade_reason = ''
+            if not budget_ok:
+                downgrade_reason = (
+                    f'改动超幅（改{met["changed_span"]}字/保留{met["retention"]}'
+                    f'/句界{met["boundary_delta"]}）')
+            elif conflict:
+                downgrade_reason = conflict
+            elif cur == sug:
+                downgrade_reason = '建议文本与原文相同'
+
             ann_result = apply_annotation(
                 p_el, cur, fc,
                 next_cmt_id, author, date_iso,
                 suggested=sug, reason=reason,
                 description=desc, category=cat)
-            if ann_result is not False:
-                cmt_id, ann_cat, ann_fc, ann_cur, ann_sug, ann_reason, ann_desc = ann_result
-                title = f'【必改】{ann_cat}'
-                COMMENT_ENTRIES.append((cmt_id, author, date_iso, title, ann_sug, ann_reason))
-                next_cmt_id += 1
-                must_ann_done += 1
-            else:
+            if ann_result is False:
                 must_ann_fail += 1
-
-        # Step 2: Build combined tracked change (single diff per paragraph)
-        # Get full paragraph text
-        joined = ''
-        for r in p.findall(qn('r')):
-            t_el = r.find(qn('t'))
-            txt = t_el.text or '' if t_el is not None else ''
-            joined += txt
-        if not joined:
-            continue
-
-        # Filter findings that pass the amplitude gate
-        passed = []
-        for pl in findings_list:
-            p_el, cpos, cur, sug, fc, reason, cat, desc, pn = pl
-            met = measure_mtf(cur, sug)
-            if met['changed_span'] <= MTF_SHORT_SKIP_GATE:
-                budget_ok = True
+                continue
+            cmt_id, ann_cat, ann_fc, ann_cur, ann_sug, ann_reason, ann_desc = ann_result
+            must_ann_done += 1
+            tracked = False
+            if will_track:
+                tracked = apply_track_change(
+                    p_el, cur, sug, next_rid, author, date_iso)
+            if tracked:
+                track_done += 1
+                deleted, inserted = _expected_revision_delta(cur, sug)
+                EXPECTED_REVISIONS.append(
+                    (str(next_rid), deleted, inserted))
+                next_rid += 1
+                title = f'【必改】{ann_cat}'
             else:
-                min_ret = MTF_SHORT_RETENTION if met['changed_span'] <= 4 else MTF_RETENTION_FLOOR
-                budget_ok = (
-                    met['changed_span'] <= MTF_CHANGED_SPAN_CAP
-                    and met['retention'] >= min_ret
-                    and met['boundary_delta'] <= MTF_BOUNDARY_CAP
-                )
-            if not budget_ok:
                 downgraded += 1
                 track_skip += 1
-                print(f'  ⛔超幅: P{pn} 改{met["changed_span"]}字/保留{met["retention"]}(阀{min_ret})'
-                      f'/句界{met["boundary_delta"]} → 仅批注不自动改')
-                continue
-            passed.append((cpos, cur, sug, pn))
-
-        if not passed:
-            continue
-
-        # Apply all changes to text (back to front so positions don't shift)
-        modified = list(joined)
-        for cpos, cur, sug, pn in sorted(passed, key=lambda x: -x[0]):
-            modified[cpos:cpos + len(cur)] = list(sug)
-        corrected = ''.join(modified)
-
-        # Single difflib diff against the ORIGINAL paragraph text
-        from difflib import SequenceMatcher
-        sm = SequenceMatcher(None, joined, corrected, autojunk=False)
-
-        # Build new elements
-        template_run = None
-        for r in p.findall(qn('r')):
-            template_run = r
-            break
-
-        new_children = []
-        for tag, i1, i2, j1, j2 in sm.get_opcodes():
-            orig_seg = joined[i1:i2]
-            new_seg = corrected[j1:j2]
-
-            if tag == 'equal' and orig_seg:
-                clone = deepcopy(template_run) if template_run else None
-                if clone is not None:
-                    ct = clone.find(qn('t'))
-                    if ct is not None:
-                        ct.text = orig_seg
-                    _strip_highlight(clone)
-                    new_children.append(clone)
-
-            elif tag == 'delete' and orig_seg:
-                del_el = etree.Element(qn('del'))
-                del_el.set(qn('id'), str(next_rid))
-                del_el.set(qn('author'), author)
-                del_el.set(qn('date'), date_iso)
-                dr = etree.SubElement(del_el, qn('r'))
-                _copy_rpr(template_run, dr) if template_run is not None else None
-                dt = etree.SubElement(dr, qn('delText'))
-                dt.text = orig_seg
-                dt.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-                new_children.append(del_el)
-
-            elif tag == 'insert' and new_seg:
-                ins_el = etree.Element(qn('ins'))
-                ins_el.set(qn('id'), str(next_rid))
-                ins_el.set(qn('author'), author)
-                ins_el.set(qn('date'), date_iso)
-                ir = etree.SubElement(ins_el, qn('r'))
-                if template_run is not None:
-                    _copy_rpr(template_run, ir)
-                irp = ir.find(qn('rPr'))
-                if irp is None:
-                    irp = etree.SubElement(ir, qn('rPr'))
-                if irp.find(qn('highlight')) is None:
-                    etree.SubElement(irp, qn('highlight')).set(qn('val'), 'yellow')
-                it = etree.SubElement(ir, qn('t'))
-                it.text = new_seg
-                it.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-                new_children.append(ins_el)
-
-            elif tag == 'replace':
-                if orig_seg:
-                    del_el = etree.Element(qn('del'))
-                    del_el.set(qn('id'), str(next_rid))
-                    del_el.set(qn('author'), author)
-                    del_el.set(qn('date'), date_iso)
-                    dr = etree.SubElement(del_el, qn('r'))
-                    if template_run is not None:
-                        _copy_rpr(template_run, dr)
-                    dt = etree.SubElement(dr, qn('delText'))
-                    dt.text = orig_seg
-                    dt.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-                    new_children.append(del_el)
-                if new_seg:
-                    ins_el = etree.Element(qn('ins'))
-                    ins_el.set(qn('id'), str(next_rid))
-                    ins_el.set(qn('author'), author)
-                    ins_el.set(qn('date'), date_iso)
-                    ir = etree.SubElement(ins_el, qn('r'))
-                    if template_run is not None:
-                        _copy_rpr(template_run, ir)
-                    irp = ir.find(qn('rPr'))
-                    if irp is None:
-                        irp = etree.SubElement(ir, qn('rPr'))
-                    if irp.find(qn('highlight')) is None:
-                        etree.SubElement(irp, qn('highlight')).set(qn('val'), 'yellow')
-                    it = etree.SubElement(ir, qn('t'))
-                    it.text = new_seg
-                    it.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-                    new_children.append(ins_el)
-
-        if new_children:
-            next_rid += 1
-
-        # Replace all w:r elements, preserve non-run children (comment markers)
-        for r in p.findall(qn('r')):
-            p.remove(r)
-        for child in new_children:
-            p.append(child)
-        track_done += 1
+                if will_track:
+                    track_fail += 1
+                    downgrade_reason = '局部 OOXML 写回冲突'
+                print(f'  ⛔降级: P{pn} {downgrade_reason} → 仅批注不自动改')
+                title = f'待核【{ann_cat}】'
+                ann_reason = '\n'.join(filter(None, [
+                    ann_reason,
+                    f'自动修订已跳过：{downgrade_reason}',
+                ]))
+            COMMENT_ENTRIES.append(
+                (cmt_id, author, date_iso, title, ann_sug, ann_reason))
+            next_cmt_id += 1
 
     # ── inject trackRevisions in settings.xml ──
     if track_done and settings_xml is not None:
         tr = settings_xml.find(qn('trackRevisions'))
         if tr is None:
             settings_xml.append(etree.Element(qn('trackRevisions')))
-        settings_xml.set(mcn('Ignorable'), 'w14')
+        ignorable = settings_xml.get(mcn('Ignorable'), '').split()
+        if 'w14' not in ignorable:
+            settings_xml.set(
+                mcn('Ignorable'), ' '.join([*ignorable, 'w14']).strip())
 
     # ── apply annotations (polish/verify) ──
     annotate_done = 0
@@ -1203,7 +1272,15 @@ def main():
         annotate_done += 1
         next_cmt_id += 1
 
+    if not COMMENT_ENTRIES and track_done == 0:
+        z.close()
+        print(
+            'ERROR: no findings could be located or annotated; output not written',
+            file=sys.stderr)
+        sys.exit(1)
+
     # ── update comments.xml ──
+    comments_ext_xml = None
     if COMMENT_ENTRIES:
         try:
             old_root = etree.fromstring(z.read('word/comments.xml'))
@@ -1212,9 +1289,32 @@ def main():
         new_comments = build_comment_xml(COMMENT_ENTRIES)
         for child in new_comments:
             old_root.append(child)
+        comment_para_ids = _ensure_comment_para_ids(old_root)
+        try:
+            comments_ext_xml = etree.fromstring(
+                z.read('word/commentsExtended.xml'))
+        except (KeyError, etree.XMLSyntaxError):
+            comments_ext_xml = _build_comments_extended([])
+        existing_ext_ids = {
+            item.get(f'{{{W15}}}paraId')
+            for item in comments_ext_xml.iter(f'{{{W15}}}commentEx')
+        }
+        for para_id in comment_para_ids:
+            if para_id in existing_ext_ids:
+                continue
+            item = etree.SubElement(comments_ext_xml, f'{{{W15}}}commentEx')
+            item.set(f'{{{W15}}}paraId', para_id)
+            item.set(f'{{{W15}}}done', '0')
+            existing_ext_ids.add(para_id)
 
     # ── write back ──
-    tmp_path = docx_path + '.tmp.docx'
+    out_path = args.out or os.path.join(d, f'{stem}_审阅版.docx')
+    out_path = os.path.abspath(out_path)
+    if Path(docx_path).resolve() == Path(out_path).resolve():
+        print('ERROR: output path must not overwrite the source document', file=sys.stderr)
+        sys.exit(1)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    tmp_path = out_path + '.tmp'
     with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED) as out:
         for name in z.namelist():
             if name == 'word/document.xml':
@@ -1223,6 +1323,8 @@ def main():
                 out.writestr(name, etree.tostring(old_root, xml_declaration=True, encoding='UTF-8', standalone=True))
             elif name == 'word/settings.xml' and track_done and settings_xml is not None:
                 out.writestr(name, etree.tostring(settings_xml, xml_declaration=True, encoding='UTF-8', standalone=True))
+            elif name == 'word/commentsExtended.xml' and comments_ext_xml is not None:
+                out.writestr(name, etree.tostring(comments_ext_xml, xml_declaration=True, encoding='UTF-8', standalone=True))
             elif name == 'word/styles.xml' and COMMENT_ENTRIES:
                 styles_el = etree.fromstring(z.read(name))
                 _inject_comment_styles(styles_el)
@@ -1234,117 +1336,85 @@ def main():
         if COMMENT_ENTRIES and 'word/comments.xml' not in z.namelist():
             out.writestr('word/comments.xml',
                          etree.tostring(old_root, xml_declaration=True, encoding='UTF-8', standalone=True))
-            rebuild_ct = True
-            rebuild_rels = True
 
-        # Write commentsExtended.xml for WPS comment-to-paragraph anchoring
-        if COMMENT_ENTRIES and 'word/commentsExtended.xml' not in z.namelist():
-            cmt_para_map = _map_comment_para_ids(doc_xml)
-            if cmt_para_map:
-                cmt_ext = _build_comments_extended(cmt_para_map)
-                out.writestr('word/commentsExtended.xml',
-                             etree.tostring(cmt_ext, xml_declaration=True, encoding='UTF-8', standalone=True))
-                rebuild_ct = True
-                rebuild_rels = True
+        if comments_ext_xml is not None and 'word/commentsExtended.xml' not in z.namelist():
+            out.writestr('word/commentsExtended.xml', etree.tostring(
+                comments_ext_xml, xml_declaration=True, encoding='UTF-8', standalone=True))
+        if (track_done and settings_xml is not None
+                and 'word/settings.xml' not in z.namelist()):
+            out.writestr('word/settings.xml', etree.tostring(
+                settings_xml, xml_declaration=True, encoding='UTF-8', standalone=True))
 
     z.close()
 
-    # ── handle rels and content types if comments were added ──
+    # Register only parts that were actually written. This prevents the
+    # commentsExtended dangling relationship that made python-docx reject the
+    # previous output.
     if COMMENT_ENTRIES:
-        # Ensure rebuild flags exist (may have been set by altChunk create path)
-        try:
-            rebuild_ct
-        except NameError:
-            rebuild_ct = False
-        try:
-            rebuild_rels
-        except NameError:
-            rebuild_rels = False
         comments_ct = 'application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml'
-        rebuild_ct = False
-        rebuild_rels = False
-
-        # Read existing [Content_Types].xml; create skeleton if missing
-        try:
-            with zipfile.ZipFile(tmp_path, 'r') as ztmp:
-                ct_data = ztmp.read('[Content_Types].xml')
-            ct_xml = etree.fromstring(ct_data)
-        except (KeyError, etree.XMLSyntaxError):
-            ct_xml = etree.Element(f'{{http://schemas.openxmlformats.org/package/2006/content-types}}Types')
+        with zipfile.ZipFile(tmp_path, 'r') as ztmp:
+            package_names = set(ztmp.namelist())
+            ct_xml = etree.fromstring(ztmp.read('[Content_Types].xml'))
+            rels_xml = etree.fromstring(ztmp.read('word/_rels/document.xml.rels'))
         ct_ns = ct_xml.tag.split('}')[0].strip('{') if '}' in ct_xml.tag else ''
-        # Check if comments override exists
-        has_comment_ct = any(
-            child.tag.endswith('Override') and 'comments.xml' in (child.get('PartName', '') or '')
-            for child in ct_xml
-        )
-        if not has_comment_ct:
-            ov = etree.SubElement(ct_xml, f'{{{ct_ns}}}Override')
-            ov.set('PartName', '/word/comments.xml')
-            ov.set('ContentType', comments_ct)
-            rebuild_ct = True
+        part_specs = [
+            ('word/comments.xml', comments_ct,
+             'http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments',
+             'comments.xml', 'rComments'),
+            ('word/commentsExtended.xml',
+             'application/vnd.openxmlformats-officedocument.wordprocessingml.commentsExtended+xml',
+             'http://schemas.microsoft.com/office/2011/relationships/commentsExtended',
+             'commentsExtended.xml', 'rCommentsExt'),
+        ]
+        for part, content_type, rel_type, target, rel_prefix in part_specs:
+            if part not in package_names:
+                continue
+            if not any(child.tag.endswith('Override')
+                       and child.get('PartName') == f'/{part}' for child in ct_xml):
+                override = etree.SubElement(ct_xml, f'{{{ct_ns}}}Override')
+                override.set('PartName', f'/{part}')
+                override.set('ContentType', content_type)
+            if not any(rel.get('Type') == rel_type for rel in rels_xml):
+                rel = etree.SubElement(rels_xml, f'{{{REL}}}Relationship')
+                rel.set('Id', _next_relationship_id(rels_xml, rel_prefix))
+                rel.set('Type', rel_type)
+                rel.set('Target', target)
 
-        # Register commentsExtended.xml Content Type (WPS requirement)
-        has_cmt_ext_ct = any(
-            child.tag.endswith('Override') and 'commentsExtended.xml' in (child.get('PartName', '') or '')
-            for child in ct_xml
-        )
-        if not has_cmt_ext_ct:
-            ov = etree.SubElement(ct_xml, f'{{{ct_ns}}}Override')
-            ov.set('PartName', '/word/commentsExtended.xml')
-            ov.set('ContentType', 'application/vnd.openxmlformats-officedocument.wordprocessingml.commentsExtended+xml')
-            rebuild_ct = True
+        tmp2 = tmp_path + '.rels'
+        with zipfile.ZipFile(tmp_path, 'r') as zin:
+            with zipfile.ZipFile(tmp2, 'w', zipfile.ZIP_DEFLATED) as zout:
+                for name in zin.namelist():
+                    if name == '[Content_Types].xml':
+                        zout.writestr(name, etree.tostring(
+                            ct_xml, xml_declaration=True, encoding='UTF-8', standalone=True))
+                    elif name == 'word/_rels/document.xml.rels':
+                        zout.writestr(name, etree.tostring(
+                            rels_xml, xml_declaration=True, encoding='UTF-8', standalone=True))
+                    else:
+                        zout.writestr(name, zin.read(name))
+        os.replace(tmp2, tmp_path)
 
-        # Read existing rels; create skeleton if missing
+    expected_comment_ids = [entry[0] for entry in COMMENT_ENTRIES]
+    try:
+        audit = audit_docx(
+            tmp_path,
+            expected_comment_ids=expected_comment_ids,
+            expected_author=author,
+            require_revisions=track_done > 0,
+            expected_revisions=EXPECTED_REVISIONS,
+        )
+    except (OSError, zipfile.BadZipFile, etree.XMLSyntaxError, DocxAuditError) as exc:
         try:
-            with zipfile.ZipFile(tmp_path, 'r') as ztmp:
-                rels_data = ztmp.read('word/_rels/document.xml.rels')
-            rels_xml = etree.fromstring(rels_data)
-        except (KeyError, etree.XMLSyntaxError):
-            rels_xml = etree.Element('{http://schemas.openxmlformats.org/package/2006/relationships}Relationships')
-        has_comment_rel = any(
-            rel.get('Target') and 'comments.xml' in rel.get('Target', '')
-            for rel in rels_xml
-        )
-        if not has_comment_rel:
-            r = etree.SubElement(rels_xml, '{http://schemas.openxmlformats.org/package/2006/relationships}Relationship')
-            r.set('Id', 'rComments1')
-            r.set('Type', 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments')
-            r.set('Target', 'comments.xml')
-            rebuild_rels = True
-
-        # Register commentsExtended.xml relationship (WPS requirement)
-        has_cmt_ext_rel = any(
-            rel.get('Target') and 'commentsExtended.xml' in (rel.get('Target', '') or '')
-            for rel in rels_xml
-        )
-        if not has_cmt_ext_rel:
-            r = etree.SubElement(rels_xml, '{http://schemas.openxmlformats.org/package/2006/relationships}Relationship')
-            r.set('Id', 'rCommentsExt1')
-            r.set('Type', 'http://schemas.microsoft.com/office/2011/relationships/commentsExtended')
-            r.set('Target', 'commentsExtended.xml')
-            rebuild_rels = True
-
-        if rebuild_ct or rebuild_rels:
-            tmp2 = tmp_path + '.2'
-            with zipfile.ZipFile(tmp_path, 'r') as zin:
-                with zipfile.ZipFile(tmp2, 'w', zipfile.ZIP_DEFLATED) as zout:
-                    for name in zin.namelist():
-                        if name == '[Content_Types].xml' and rebuild_ct:
-                            zout.writestr(name, etree.tostring(ct_xml, xml_declaration=True, encoding='UTF-8', standalone=True))
-                        elif name == 'word/_rels/document.xml.rels' and rebuild_rels:
-                            zout.writestr(name, etree.tostring(rels_xml, xml_declaration=True, encoding='UTF-8', standalone=True))
-                        else:
-                            zout.writestr(name, zin.read(name))
-            os.replace(tmp2, tmp_path)
-
-    # Rename to _审阅版.docx
-    out_path = args.out or os.path.join(d, f'{stem}_审阅版.docx')
-    if os.path.exists(out_path):
-        os.remove(out_path)
-    os.rename(tmp_path, out_path)
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        print(f'ERROR: generated DOCX failed OOXML audit: {exc}', file=sys.stderr)
+        sys.exit(1)
+    os.replace(tmp_path, out_path)
 
     print(f'\nDone: {track_done} track, {track_fail} fail, {must_ann_done} must-ann, {must_ann_fail} must-ann-fail, {annotate_done} polish/verify-ann, {annotate_fail} polish/verify-ann-fail'
           + (f' | ⛔超幅降级批注 {downgraded}' if downgraded else ''))
+    print(f'Audit: {audit["comments"]} comments, {audit["revisions"]} revision nodes, relationships {audit["relationships"]}')
     print(f'→ {out_path}')
 
 

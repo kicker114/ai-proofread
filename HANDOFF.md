@@ -1,173 +1,166 @@
-# HANDOFF — ai-proofread 中文书稿审校工具集 (2026-08-05 17:30)
+# HANDOFF — ai-proofread Codex Word/PDF 审校入口（2026-08-06）
 
-**Scope:** repo:ai-proofread | branch:main | commit:68dae93 (clean)
-**Status:** shipped — 全线可投产，刚完成一份 5.8MB DOCX 书稿的完整审校
-**From:** Claude Code session (deepseek-v4-pro)
-**To:** 下一个 Agent / 新会话 / 未来的自己
+**Scope:** `/Users/kicker114/Developer/ai-proofread`
+**Branch / HEAD:** `main` / current committed HEAD
+**Status:** Codex 入口、Word 字符级修订批注、PDF 高亮批注均已实现并完成专项验收；本次实现已提交。
 
----
+> 工作树原有 `.workbuddy/memory/2026-08-05.md` 用户修改。本次实现没有编辑该文件，后续提交时不要把它当成本次产物覆盖或回退。
 
 ## Goal
 
-基于 [Fusyong/ai-proofread](https://github.com/Fusyong/ai-proofread) 改造的中文书稿审校 CLI 工具集。核心交付：终端一键 `proofread max` 打通全部审校环节（确定性检查 → LLM 审校 → 对齐 → 报告 → DOCX 回写），外加 PDF 审校工具链。
+让 Codex 在本仓库内自动发现中文审校工作流，并使用项目自身的确定性工具完成：
 
-## Current Status
+- `.docx`：字符级 Word 修订（`w:del/w:ins`）及标准批注。
+- 带文字层 `.pdf`：在原版式 PDF 上写入标准 Highlight 高亮及弹窗批注。
+- 两种审校来源：现有 DeepSeek max 流水线，或 Codex 原生审校并联网核验事实。
 
-全部子命令可用，02 引擎（直接 OOXML）为默认回写引擎。最近一次实战验证：对 131,238 字的 DOCX 书稿跑通完整管线，产出精修版 MD + 综合报告 + 句子级勘误表 + 带修订批注的 DOCX。
+不依赖 OfficeCLI、docx-mcp、Adeu 或其他 MCP。原文件始终只读。
 
-## Source of Truth
+## Codex Entry
 
-- 代码：`main` 分支，工作树干净，无未提交改动
-- 文档：`README.md`（使用说明）、`CLAUDE.md`（架构与开发指南）、`docs/`（对齐算法分析与对比报告）
-- 安装方式：`pip install -e . --break-system-packages`，安装在系统 Python 3.14 (`/usr/local/bin/proofread`)
-- API Key：`src/.env` 已配置 `DEEPSEEK_API_KEY`（gitignored）
+- `AGENTS.md`：仓库级自动路由和安全门禁。
+- `.agents/skills/ai-proofread/SKILL.md`：项目级 `$ai-proofread` Skill。
+- `.agents/skills/ai-proofread/agents/openai.yaml`：Codex Skills UI 元数据。
 
-## Files Changed (本次会话)
+模式：
 
-- `CLAUDE.md` — 新建，项目架构与开发指南（含 WorkBuddy/PDF 工具链文档）
-- `HANDOFF.md` — 新建，本文件
+| 模式 | 审校发现来源 | 写回后端 |
+|---|---|---|
+| `pipeline`（默认） | `proofread max` / DeepSeek | 02 OOXML / PyMuPDF |
+| `codex-native` | Codex 按项目规则生成 findings；事实项可联网核验 | 同上 |
 
-## Architecture Summary
+DeepSeek API 调用不等于实时联网检索。需要事实来源时必须使用 `codex-native`，并记录实际访问的权威网页。
 
-```
-src/
-├── cli.py                  # argparse CLI 入口，6 个子命令，DOCX→MD 自动转换
-├── max_pipeline.py         # ★ max 模式编排器：Phase 0a→0b→0c→1→2→3→4 + writeback (851行)
-├── proofreader.py           # DeepSeek/Google API 调用，RateLimiter，async pipeline + 断点续跑
-├── splitter.py             # Markdown 按标题/长度切分 + 中文句子切分
-├── writeback_engine.py     # 02 引擎：直接 OOXML 字符级修订+批注 (1352行，最复杂模块)
-├── writeback.py            # Adeu MCP 旧方案（--engine adeu，需 agent 上下文）
-├── sentence_aligner.py     # 锚点 + Jaccard n-gram 句子对齐
-├── html_report_v2.py       # HTML 报告渲染（对齐勘误表 + 综合报告）
-├── diff_tools.py           # HTML 词级 diff
-├── pdf_pipeline.py         # PDF 工具链：pdf2md + annotate（PyMuPDF 高亮批注）
-├── special_checker/        # TGSCC 汉字规范 + MDict 词典查询 + 模糊匹配
-├── structure_checker/      # 层级 + 编号连续性检查（scanner→builder→rules→report）
-└── resource/               # 系统提示词 (rewrite/JSON 两套) + TGSCC 数据 + jsdiff 模板
-```
+长稿 codex-native 以连续 P/页码分批（每批最多 40 units，约不超过 12,000
+非空白字符），保存批次 findings 和覆盖 checkpoint；合并去重前必须证明
+`review_source.json` 的每个 unit 恰好覆盖一次。
 
-### max pipeline 各阶段
+## Public Interfaces
 
-| Phase | 内容 | 引擎 | 耗时特征 |
-|-------|------|------|----------|
-| 0a | 汉字规范 | TGSCC 查表 | 秒级 |
-| 0b | 异形词/词形 | 离线词典扫描 | 毫秒级 |
-| 0c | 结构检查 | structure_checker | 毫秒级 |
-| 1 | LLM 审校 | DeepSeek JSON 发现模式，分块异步并发 | **占 99%+ 时间** |
-| 2 | 专名查词 | LLM 识别 + MDict 词典（需 --names） | 可选 |
-| 3 | 句子对齐 | 锚点 + Jaccard n-gram | 秒级 |
-| 4 | 综合报告 | HTML 聚合渲染 | 秒级 |
-| 5 | DOCX 回写 | 02 引擎 OOXML 修订+批注（需 --writeback） | 十秒级 |
+```zsh
+# 生成带稳定位置和源文件哈希的 Codex 审校源
+proofread extract <source.docx|source.pdf> --out <review_source.json>
 
-### 关键设计决策
+# Word findings 写回
+proofread w <source.docx> --findings <findings.json> [--source-manifest <review_source.json>] --out <review.docx> --author "Codex审校"
 
-- **JSON 发现模式 vs 全文重写**：Phase 1 使用 JSON 发现模式（模型只输出 `[{original, corrected}]`），而非全文重写。原因：全文重写可能误改译名/署名/专名，且 token 消耗大。效果：精准句改，保留原文格式。
-- **02 引擎 vs Adeu MCP**：02 引擎（默认）用 lxml+zipfile 直接操作 `word/document.xml`，零中间文本转换，保留既有修订。Adeu 是旧方案，需 Claude Code agent 上下文，保留兼容但不推荐。
-- **P 编号贯穿**：`max_pipeline._build_para_text_map()` 与 `writeback_engine.build_para_map()` 必须逐字节一致。两者有重复的 `_para_raw_text()` 逻辑——这是故意的，不要重构为共享函数。
-- **DeepSeek V4 Flash 默认**：`temperature=1.3`（校对推荐值，更低会减少改动）。
-
-## Commands Run + Results
-
-本会话执行的命令：
-
-```
-proofread m "/Users/kicker114/Downloads/四节以后全部书稿.docx" --writeback --author "审校助手"
+# PDF 安全预览与正式写回
+python3 src/pdf_pipeline.py pdf2md <source.pdf> --out <review.md>
+proofread m <review.md> --no-view
+python3 src/pdf_pipeline.py annotate <source.pdf> <findings.json> --source-manifest <review_source.json> --dry-run --csv <preview.csv>
+python3 src/pdf_pipeline.py annotate <source.pdf> <findings.json> --source-manifest <review_source.json> --out <review.pdf> --csv <annotations.csv>
 ```
 
-结果（历时 ~28 分钟）：
+`ai-proofread.source.v1` 包含 `source_sha256`，Word 单元使用 `P<n>`，PDF 单元使用一基页码。
 
-| 阶段 | 发现/统计 | 耗时 |
-|------|-----------|------|
-| 0a TGSCC | 0 条 | 3.8s |
-| 0b 异形词 | 7 条 | 0.06s |
-| 0c 结构 | 130 条 | 0.01s |
-| 1 LLM 审校 | 621 条修正 (74 chunks) | 1687s |
-| 3 句子对齐 | 2193 match / 258 del / 228 ins | 6s |
-| 5 DOCX 回写 | 391 track changes / 4 超幅降级批注 | — |
+`ai-proofread.findings.v1` 的规范数组字段为 `issues`，每条包含：
 
-产物均在 `/Users/kicker114/Downloads/`：
-- `output_四节以后全部书稿/四节以后全部书稿_审阅版.docx` — 审阅版 DOCX
-- `四节以后全部书稿_max_report.html` — 综合报告 (274KB)
-- `四节以后全部书稿_alignment.html` — 句子级勘误表 (3.7MB)
-- `四节以后全部书稿_refined.md` — 精修版全文 (383KB)
-- `四节以后全部书稿_max_results.json` — 全部发现 (517KB)
+```json
+{
+  "fix_class": "must_fix|polish|verify",
+  "current": "原文",
+  "suggested": "建议文本",
+  "reason": "理由",
+  "category": "类别",
+  "location": "P3",
+  "page": 2,
+  "evidence": [{"title": "来源", "url": "https://...", "accessed_at": "YYYY-MM-DD"}]
+}
+```
 
-## Verification Passed
+Word 使用 `location`，PDF 必须使用一基整数 `page`。`findings` 数组名仅作为兼容别名保留；若 `issues` 同时存在则以规范字段为准。v1 缺少必填字段/哈希、证据不完整、哈希不符或任何输出路径覆盖源文件时必须失败。legacy Word/PDF findings 均需通过 `--source-manifest` 绑定原文件。
 
-- [x] 6 个子命令（p/b/m/w/d/s）均可通过 `proofread --help` 查看
-- [x] max pipeline 全阶段跑通（Phase 0a→0b→0c→1→3→4→5），exit code 0
-- [x] DOCX→MD 自动转换正常（5.8MB → 381KB，1157 段）
-- [x] LLM JSON 发现模式 74 chunks 全部处理、无一失败
-- [x] 02 引擎回写成功生成审阅版 DOCX（391 处修订 + 626 条批注）
-- [x] 超幅保护生效：4 处超过安全阈值的改写自动降级为仅批注
-- [x] PDF 工具链代码已合并（`pdf_pipeline.py`，commit 68dae93）
+## Word Engine
 
-## Not Verified Yet
+`src/writeback_engine.py` 现在：
 
-- Google Gemini 模型路径未测试（当前只用 DeepSeek）
-- Aliyun Bailian (`deepseek-v3`) 路径未测试
-- `--names` 专名查词功能未在本次实战中启用（需 MDict 词典文件）
-- PDF annotate 跨页定位在实际排版复杂的 PDF 上的命中率
-- 并发场景下的 RPM 限速器是否严格守约
+- 把 `commentReference` 放进带 `CommentReference` 样式的 `w:r`。
+- 只拆分命中的直接文本 run；保留未命中格式、表格、超链接和既有修订。
+- 对超链接、字段、制表符/绘图、内容控件、既有修订或重复锚点不强改，降级为待核批注。
+- 显式 P 位置不再跨段回退；模糊定位只批注，短锚点扩写受新增字符和长度振幅门禁约束。
+- 保留既有 `commentsExtended.xml` 条目及状态，只追加新 commentEx。
+- 合并而不是覆盖 `settings.xml` 已有 `mc:Ignorable` token。
+- 写临时包后审计所有 XML、关系目标、Content Types、批注 ID 和修订作者，再原子替换输出。
+- 每次写回在隔离目录装载 findings，旧 results 不会串入；`proofread w --out` 已真正生效，空发现或子进程失败不会覆盖已有审阅版。
+- 源 DOCX 先复制到哈希校验快照，输出也先留在隔离目录；交付前再次核对原路径，避免审校期间换稿和 symlink 覆盖。
 
-## Key Decisions
+Word max 在审校前记录源 DOCX 哈希并写入 `_max_results.json`，Phase 5 前再次核对；专名 findings 现在包含在保存结果和写回集合中，零发现也会原子覆盖旧 JSON。
 
-| 决策 | 选择 | 理由 |
-|------|------|------|
-| 默认模型 | deepseek-v4-flash | 速度快、中文审校质量足够、token 便宜 |
-| 回写引擎 | 02 引擎（直接 OOXML） | 零中间转换损耗，保留既有修订，不依赖外部 MCP |
-| Phase 1 模式 | JSON 发现而非全文重写 | 精准句改，防误改专名/署名，token 消耗更低 |
-| PDF 批注 | 本地 PyMuPDF | WorkBuddy/Tencent Docs 均无 PDF 标注 API |
-| 振幅保护 | must_fix 有 changed_span_cap / retention_floor | 防 LLM 过度改写，超幅降级为仅批注 |
-| temperature | 1.3 | 校对实测最优：太低改动少，太高幻觉多 |
+DOCX→Markdown 和 `proofread extract` 都按正文/表格实际顺序输出，P 编号与 02 引擎一致。
 
-## Assumptions / Risks
+## PDF Engine
 
-- 假设 DeepSeek API (`api.deepseek.com`) 可通过当前网络直连（需在代理白名单中）
-- 假设输入 DOCX 的段落样式使用标准 `Heading 1`–`9` 命名
-- 假设 `src/.env` 中的 `DEEPSEEK_API_KEY` 余额充足
-- 风险：02 引擎 P 编号依赖 `_para_raw_text()` 逻辑不变；如果修改此函数需同步更新 `max_pipeline.py` 中的副本
-- 风险：超长书稿（>200,000 字）的 LLM 审校可能消耗大量 token（本次 131,238 字消耗约 74 chunks × ~2,000 token/chunk ≈ 150K token）
+`src/pdf_pipeline.py` 现在：
 
-## Environment
+- `pdf2md` 逐页按原文字元保留率比较 pymupdf4llm 与 PyMuPDF raw text，而不是只比较长度；覆盖率低于 75% 时自动采用完整 raw text，避免等长错误内容掩盖漏字。
+- `annotate` 使用 `rawdict` 字符 bbox 生成逐行 quads，不再把多行/双栏合并成大矩形。
+- 枚举全部 exact；重复原文必须由 `page` 唯一消歧，否则为 `ambiguous`。
+- fragment/fuzzy 默认只进入 preview；仅显式 `--allow-fragment` / `--allow-fuzzy` 才写入；fuzzy 并列候选即使允许也保持 `ambiguous`。
+- 严格校验 `ai-proofread.findings.v1`，并用 `--source-manifest` 给 legacy max 结果提供审校期间哈希门禁。
+- CSV 记录状态、方法、真实分数、候选页、quad 数和原因；PDF 先写临时文件，重开验证注释类型、作者、内容、页码和 quad 后再原子替换目标。
+- PDF 定位始终读取已校验的临时快照，定位后和正式交付前再次核对原路径哈希。
 
-- Python: 3.14.6 (`/usr/local/bin/python3.14`)
-- CLI: `/usr/local/bin/proofread`（通过 `pip install -e .` 安装）
-- OS: macOS Darwin 24.6.0
-- 关键依赖: openai, google-genai, jieba, numpy, scikit-learn, mdict-utils, loguru, pymupdf4llm, rapidfuzz, python-dotenv, lxml
-- API Key: `src/.env` 已配置 DEEPSEEK_API_KEY
+## Verification Evidence
+
+### Focused regression suite
+
+```zsh
+python3 -m unittest \
+  tests.test_extract_source \
+  tests.test_codex_entry \
+  tests.test_pdf_pipeline \
+  tests.test_word_writeback
+```
+
+- 39/39 tests passed。
+- Skill `quick_validate.py` passed。
+- fresh `codex exec --ephemeral -s read-only` 自动识别 `$ai-proofread`、默认 `pipeline`、02 引擎和源文件只读约束。
+- `python3 -m compileall`、`git diff --check` passed。
+
+### Codex-native Word test
+
+- 合成文档：多 run 格式、表格、事实错误和润色项。
+- 使用 [NASA Moon Facts](https://science.nasa.gov/moon/facts/) 实际联网核验，来源 URL 成功进入 Word 批注。
+- 写回结果：1 个字符级替换、2 条批注、2 个 revision nodes。
+- `python-docx` 重开、ZIP/XML/关系审计、LibreOffice 转 PDF及页面渲染均通过。
+- 源 SHA-256 保持 `e7407675860f915a8531375b969e847da1b81be37b7f86ff9b82200f37a151a5`。
+- 可检查产物：`/Users/kicker114/Downloads/月球事实测试_Codex审阅版.docx`。
+- Word 产物 SHA-256：`203bb93eb52c5ca6c8593d34d71ae9f726a2435485cdef0cc4482b9db8b4a060`。
+
+### Real mixed-layout PDF test
+
+- 输入：`/Users/kicker114/Downloads/月球测试.pdf`，2 页。
+- 源 SHA-256：`5f6c59ec47619e4303f546e5973817529dcbbba6012ab347266ba98047d54ca3`。
+- pymupdf4llm 原始覆盖率仅 7.4% / 40.7%；自动 fallback 后恢复 1253 个非空白文字字符，生成 3724 字符 Markdown。
+- DeepSeek max 实跑：11 chunks，314 秒；8 条结构发现 + 10 条 LLM 发现。
+- PDF dry-run：6 exact hit / 4 fragment preview / 8 structure skip。
+- 正式安全写回：6 条 findings，生成 6 个 Highlight annotations（第 1 页 3 条，第 2 页 3 条）；4 个 fragment 未自动写入。
+- PyMuPDF 重开校验和两页视觉渲染通过，原 PDF 哈希未变化。
+- 最终产物：`/Users/kicker114/Downloads/月球测试_Codex审阅版.pdf`、`/Users/kicker114/Downloads/月球测试_Codex批注清单.csv`。
+- PDF / CSV 产物 SHA-256：`cef2f6f0497ddbfe747043690b830874eb05d4a5a3c5e877e2be3748cdd8f39d` / `7bd0052c33cc9cc34aa391a67d35314d78809543a12ffa14047cdab4b35ad21a`。
+
+另有合成跨页 PDF 回归：单条 finding 跨两页时生成两组 page-local quads；源文件在定位/交付期间变化时不生成产物。
+
+## Known Limits
+
+- 只支持 `.docx`；旧 `.doc` 需先转换。
+- 纯扫描 PDF 必须先 OCR；混合 PDF 的无文字层页面会列出并跳过。
+- fragment/fuzzy 和无法消歧的重复文本不会默认写入，不能为追求命中率绕过 dry-run。
+- Word 的字段、超链接或既有修订只能安全地整段/整 run 挂待核批注；原文不会被改，但可视批注范围可能宽于目标字符。
+- Google Gemini、Aliyun Bailian、`--names` 本轮未测试。
+- 全量 `unittest discover` 仍有两个既有导入错误：`test_performance.py`、`test_two_stage.py` 引用已移除的 `src.sentence_aligner_simple`。它们不属于本次 Codex/Word/PDF 回归门。
+
+## Files Changed
+
+- Codex：`AGENTS.md`、`.agents/skills/ai-proofread/`。
+- Interfaces：`src/extract_source.py`、`src/cli.py`、`pyproject.toml`。
+- Engines：`src/writeback_engine.py`、`src/max_pipeline.py`、`src/pdf_pipeline.py`。
+- Tests：四个 `tests/test_*` Codex/Word/PDF 回归文件。
+- Docs：`README.md`、`CLAUDE.md`、`HANDOFF.md`、`.workbuddy/agents/pdf-proofreader.md`。
 
 ## Next Safe Action
 
-若继续开发：
-
-1. 先读 `CLAUDE.md` 了解架构约束，再读 `README.md` 了解使用方式
-2. 如果要改回写引擎：打开 `src/writeback_engine.py`，特别注意 P 编号逻辑（`build_para_map` / `_para_raw_text`），任何改动需同步 `src/max_pipeline.py:95-140`
-3. 如果要改 LLM 审校：打开 `src/max_pipeline.py` 的 `phase1_json_proofread()` + `src/resource/prompt-proofreader-system-outputJSON.xml`
-4. 如果要加新检查环节：在 `src/max_pipeline.py` 的 `run_max()` 中插入新 Phase，遵循 `results[key] = ...` 模式
-5. 改完后跑一次完整 max pipeline 验证（用小文件即可，不必每次 5MB+）
-6. 提交前确认 `git diff --stat` 无意外改动
-
-若只是使用（审校新书稿）：
-
-```bash
-proofread m <新书稿.docx> --writeback --author "审校助手"
-# 可选参数: --concurrent 5 --model deepseek-v4-pro --names
-```
-
-## Don't Do / Gotchas
-
-- **不要重构 `_para_raw_text()` 为共享函数**：`max_pipeline.py` 和 `writeback_engine.py` 各有一份实现，这是故意的——P 编号回写要求两者逐字节一致，共享后一旦一方被误改，回写会静默错位到错误段落
-- **不要降低 temperature 到 1.0 以下**：会让模型过于保守、几乎不改任何文字
-- **不要对同一文件同时跑两个 `proofread max`**：输出文件会互相覆盖
-- **不要在 `src/.env` 中使用引号包裹 API Key**：`python-dotenv` 会原样读取，引号会被当作 key 的一部分
-- **PDF annotate 前先 dry-run**：`python3 src/pdf_pipeline.py annotate book.pdf findings.json --dry-run --csv preview.csv` 确认命中率再正式跑
-- **不要在生产书稿上测试未经 dry-run 验证的规则改动**
-
-## Related Docs
-
-- `README.md` — 完整使用说明（CLI 命令、快速开始、常见问题）
-- `CLAUDE.md` — 架构与开发指南（供 Agent 使用）
-- `docs/comparison-analysis-ai-proofread-max-vs-pub-political.md` — 双管线对比分析
-- `docs/新对齐算法设计方案.md` — 对齐算法设计文档
-- `.workbuddy/agents/pdf-proofreader.md` — WorkBuddy PDF 审校 Agent 入口
+1. 先运行上面的 39 项专项回归。
+2. 检查 `git diff --check` 和 `git status --short`。
+3. 提交时保留用户原有 `.workbuddy/memory/2026-08-05.md` 修改，不回退，也不要误称为本次实现。
+4. 对新的真实稿件始终先生成审校源/哈希；PDF 必须先 dry-run。

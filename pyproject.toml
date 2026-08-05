@@ -17,7 +17,10 @@ dependencies = [
     "scikit-learn",
     "mdict-utils",
     "loguru",
+    "PyMuPDF>=1.27",
     "pymupdf4llm",
+    "python-docx>=1.2",
+    "lxml>=6",
     "rapidfuzz",
 ]
 
@@ -26,4 +29,3 @@ proofread = "src.cli:main"
 
 [tool.setuptools]
 packages = {find = {}} # 自动发现src目录下的所有包
-

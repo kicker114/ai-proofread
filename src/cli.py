@@ -7,6 +7,7 @@ pip install -e . 后全局可用:
     proofread b <file.md|file.docx>             # 全书分块校对
     proofread m <file.md|file.docx>             # ★ 最大化检查（全环节）
     proofread w <file.docx>                     # DOCX 修订+批注回写
+    proofread extract <file.docx|file.pdf>      # Codex 定位化文本提取
     proofread d <原稿.md> <校后.md>               # 生成 HTML diff
     proofread s <file.md>                       # 汉字规范专项检查
 
@@ -51,34 +52,19 @@ AVAILABLE_MODELS = [
 def _docx_to_md(file_path: Path) -> tuple[Path, str]:
     """Convert a .docx file to .md for processing. Returns (md_path, text)."""
     try:
-        import docx
+        from .extract_source import extract_docx_units
     except ImportError:
-        print("❌ 需要 python-docx 库: pip install python-docx")
+        print("❌ 需要 lxml 库: python3 -m pip install 'lxml>=6'")
         sys.exit(1)
 
     stem = file_path.parent / file_path.stem
     md_path = stem.parent / f"{stem.name}.md"
 
-    doc = docx.Document(str(file_path))
     paragraphs = []
-
-    for para in doc.paragraphs:
-        text = para.text.strip()
-        if not text:
-            paragraphs.append("")
-            continue
-
-        style = para.style.name if para.style else "Normal"
-
-        # 标题转换
-        if style.startswith("Heading"):
-            level = style.replace("Heading", "").strip()
-            if level.isdigit() and 1 <= int(level) <= 9:
-                paragraphs.append(f"{'#' * int(level)} {text}")
-            else:
-                paragraphs.append(text)
-        else:
-            paragraphs.append(text)
+    for unit in extract_docx_units(file_path):
+        text = unit["text"].strip()
+        level = unit.get("heading_level")
+        paragraphs.append(f"{'#' * level} {text}" if level else text)
 
     md_text = "\n".join(paragraphs)
 
@@ -87,6 +73,24 @@ def _docx_to_md(file_path: Path) -> tuple[Path, str]:
         f.write(md_text)
 
     return md_path, md_text
+
+
+# ── 子命令: Codex 定位化文本提取 ─────────────────────────────────────
+
+
+def cmd_extract(args):
+    """提取 DOCX/PDF 为带稳定位置与源文件哈希的 JSON。"""
+    from .extract_source import extract_source
+
+    try:
+        payload = extract_source(args.file, args.out)
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        print(f"❌ {exc}")
+        sys.exit(1)
+    print(
+        f"✅ 提取完成: {Path(args.out).resolve()} "
+        f"({payload['unit_count']} 个单元, SHA-256={payload['source_sha256'][:12]}…)"
+    )
 
 
 def _resolve_input(file_path: Path) -> Path:
@@ -346,11 +350,123 @@ def _find_source_docx(file_arg: str) -> Optional[str]:
         return str(fpath)
     # 尝试同目录下同名 .docx
     stem = fpath.parent / fpath.stem
-    for ext in (".docx", ".doc"):
+    for ext in (".docx",):
         candidate = stem.parent / f"{stem.name}{ext}"
         if candidate.exists():
             return str(candidate)
     return None
+
+
+def _validate_findings_source(
+        docx_path: str, data, source_manifest: str | None = None) -> str:
+    """Reject findings that are not cryptographically bound to this DOCX."""
+    if not isinstance(data, (dict, list)):
+        print("❌ findings 必须是对象或数组")
+        sys.exit(1)
+    expected = data.get("source_sha256") if isinstance(data, dict) else None
+    if (isinstance(data, dict)
+            and data.get("schema") == "ai-proofread.findings.v1"
+            and not expected):
+        print("❌ ai-proofread.findings.v1 缺少 source_sha256")
+        sys.exit(1)
+
+    from .extract_source import sha256_file
+
+    manifest_hash = None
+    if source_manifest:
+        try:
+            manifest = json.loads(
+                Path(source_manifest).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"❌ 无法读取 source manifest: {exc}")
+            sys.exit(1)
+        if (not isinstance(manifest, dict)
+                or manifest.get("schema") != "ai-proofread.source.v1"):
+            print("❌ source manifest 不是 ai-proofread.source.v1")
+            sys.exit(1)
+        if manifest.get("source_type") != "docx":
+            print("❌ source manifest 的 source_type 必须是 docx")
+            sys.exit(1)
+        declared_path = manifest.get("source_path")
+        if (not isinstance(declared_path, str)
+                or Path(declared_path).resolve() != Path(docx_path).resolve()):
+            print("❌ source manifest 与输入 DOCX 路径不一致")
+            sys.exit(1)
+        manifest_hash = str(manifest.get("source_sha256", "")).strip().lower()
+        import re
+        if not re.fullmatch(r"[0-9a-f]{64}", manifest_hash):
+            print("❌ source manifest 缺少有效 source_sha256")
+            sys.exit(1)
+
+    if expected and manifest_hash and str(expected).lower() != manifest_hash:
+        print("❌ findings 与 source manifest 的 SHA-256 不一致")
+        sys.exit(1)
+    bound_hash = str(expected).lower() if expected else manifest_hash
+    if not bound_hash:
+        print("❌ 旧版 findings 缺少源哈希；请传 --source-manifest")
+        sys.exit(1)
+    actual = sha256_file(docx_path)
+    if bound_hash != actual.lower():
+        print("❌ findings 与源 DOCX 不匹配（SHA-256 校验失败）")
+        print(f"   expected: {bound_hash}")
+        print(f"   DOCX:     {actual}")
+        sys.exit(1)
+    return bound_hash
+
+
+def _findings_v1_to_issues(data: dict) -> list[dict]:
+    """Validate and convert the Codex-native findings envelope for Word."""
+    import re
+
+    findings = data.get("issues", data.get("findings"))
+    if not isinstance(findings, list) or not findings:
+        print("❌ ai-proofread.findings.v1 的 issues 必须是非空数组")
+        sys.exit(1)
+
+    required = ("fix_class", "current", "suggested", "reason", "category")
+    issues: list[dict] = []
+    for index, finding in enumerate(findings, 1):
+        if not isinstance(finding, dict):
+            print(f"❌ finding #{index} 必须是对象")
+            sys.exit(1)
+        missing = [key for key in required if key not in finding]
+        if missing:
+            print(f"❌ finding #{index} 缺少字段: {', '.join(missing)}")
+            sys.exit(1)
+        if finding["fix_class"] not in ("must_fix", "polish", "verify"):
+            print(f"❌ finding #{index} 的 fix_class 无效: {finding['fix_class']}")
+            sys.exit(1)
+        for key in ("current", "suggested", "reason", "category"):
+            if not isinstance(finding.get(key), str):
+                print(f"❌ finding #{index} 的 {key} 必须是字符串")
+                sys.exit(1)
+        for key in ("current", "reason", "category"):
+            if not finding[key].strip():
+                print(f"❌ finding #{index} 的 {key} 不能为空")
+                sys.exit(1)
+        location = finding.get("location")
+        if not isinstance(location, str) or not re.fullmatch(r"P\d+", location):
+            print(f"❌ finding #{index} 缺少有效 Word 位置（应为 P<n>）")
+            sys.exit(1)
+
+        issue = dict(finding)
+        evidence = issue.get("evidence", [])
+        if not isinstance(evidence, list) or not all(isinstance(item, dict) for item in evidence):
+            print(f"❌ finding #{index} 的 evidence 必须是对象数组")
+            sys.exit(1)
+        if evidence:
+            source_lines = []
+            for source in evidence:
+                title = str(source.get("title", "")).strip()
+                url = str(source.get("url", "")).strip()
+                accessed = str(source.get("accessed_at", "")).strip()
+                if not title or not url or not accessed:
+                    print(f"❌ finding #{index} 的 evidence 缺少 title/url/accessed_at")
+                    sys.exit(1)
+                source_lines.append(f"{title}：{url}（访问日期：{accessed}）")
+            issue["reason"] = f"{issue['reason']}\n来源：" + "\n".join(source_lines)
+        issues.append(issue)
+    return issues
 
 
 def _do_writeback(docx_path: str, findings_data: dict, author: str = "审校助手"):
@@ -393,6 +509,9 @@ def cmd_writeback(args):
     if not docx_path:
         print(f"❌ 找不到源文档: {args.docx}")
         sys.exit(1)
+    if Path(docx_path).suffix.lower() != ".docx":
+        print("❌ Word 写回仅支持 .docx；请先把旧 .doc 转换为 .docx")
+        sys.exit(1)
 
     # 自动推断 findings
     findings_path = args.findings
@@ -411,10 +530,36 @@ def cmd_writeback(args):
             print("❌ 未指定 --findings，自动搜索也找不到")
             sys.exit(1)
 
+    try:
+        with open(findings_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"❌ 无法读取 findings JSON: {exc}")
+        sys.exit(1)
+    if (isinstance(data, dict) and data.get("schema")
+            and data.get("schema") != "ai-proofread.findings.v1"):
+        print(f"❌ 不支持的 findings schema: {data.get('schema')}")
+        sys.exit(1)
+    protected_inputs = {
+        Path(docx_path).expanduser().resolve(),
+        Path(findings_path).expanduser().resolve(),
+    }
+    if args.source_manifest:
+        protected_inputs.add(
+            Path(args.source_manifest).expanduser().resolve())
+    if (args.out
+            and Path(args.out).expanduser().resolve() in protected_inputs):
+        print("❌ Word 输出路径不能覆盖源 DOCX、findings JSON 或 source manifest")
+        sys.exit(1)
+    source_sha256 = _validate_findings_source(
+        docx_path, data, args.source_manifest)
+
     if args.engine == "adeu":
         # 旧方案：Adeu MCP（保留）
         from .writeback import load_findings, writeback_adeu
-        findings = load_findings(findings_path)
+        findings = (_findings_v1_to_issues(data)
+                    if isinstance(data, dict) and data.get("schema") == "ai-proofread.findings.v1"
+                    else load_findings(findings_path))
         print(f"📥 加载 {len(findings)} 条发现")
         if not findings:
             print("❌ 没有发现数据")
@@ -429,22 +574,31 @@ def cmd_writeback(args):
         _findings_to_issues, _run_02_writeback,
     )
 
-    with open(findings_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
     # 兼容 max_results.json（按 phase 分组）和 issues[] 列表
     findings = []
     if isinstance(data, list):
         findings = data
     elif isinstance(data, dict):
+        if data.get("schema") == "ai-proofread.findings.v1":
+            issues = _findings_v1_to_issues(data)
+            review = _run_02_writeback(
+                docx_path, Path(docx_path).stem, issues, args.author,
+                out_path=args.out,
+                expected_source_sha256=source_sha256)
+            print(f"✅ 审阅版: {review}")
+            return
         for key in ("tgscc", "variants", "structure", "llm", "names"):
             batch = data.get(key, [])
             if isinstance(batch, list):
                 findings.extend(batch)
+        if not findings and isinstance(data.get("findings"), list):
+            findings.extend(data["findings"])
         if not findings and isinstance(data.get("issues"), list):
             # 已经是 issues[]，直接走 02 引擎
             review = _run_02_writeback(
-                docx_path, Path(docx_path).stem, data["issues"], args.author)
+                docx_path, Path(docx_path).stem, data["issues"], args.author,
+                out_path=args.out,
+                expected_source_sha256=source_sha256)
             print(f"✅ 审阅版: {review}")
             return
 
@@ -454,7 +608,10 @@ def cmd_writeback(args):
     text_map = _build_para_text_map(docx_path)
     resolved = _resolve_findings_to_p(findings, text_map)
     issues = _findings_to_issues(resolved)
-    review = _run_02_writeback(docx_path, Path(docx_path).stem, issues, args.author)
+    review = _run_02_writeback(
+        docx_path, Path(docx_path).stem, issues, args.author,
+        out_path=args.out,
+        expected_source_sha256=source_sha256)
     print(f"✅ 审阅版: {review}")
 
 
@@ -481,7 +638,7 @@ def main():
         description="ai-proofread 命令行工具 — 终端直接调用审校，无需 VSCode",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
-子命令简写:  p=proofread  b=book  m=max  w=writeback  d=diff  s=special
+子命令简写:  p=proofread  b=book  m=max  w=writeback  x=extract  d=diff  s=special
 
 示例:
   proofread p 我的稿件.docx
@@ -489,6 +646,7 @@ def main():
   proofread m 我的稿件.docx              # ★ 最大化检查（全环节）
   proofread m 我的稿件.docx --writeback  #   审校后自动回写 DOCX
   proofread w 我的稿件.docx              #   独立回写修订+批注
+  proofread extract 我的稿件.docx --out review_source.json
   proofread d 原稿.md 校后.md
   proofread s 我的稿件.md
 
@@ -499,6 +657,13 @@ def main():
     parser.add_argument("--verbose", "-v", action="store_true", help="详细输出")
     parser.set_defaults(verbose=False)
     sub = parser.add_subparsers(dest="command")
+
+    # extract
+    x = sub.add_parser("extract", aliases=["x"],
+                       help="提取 DOCX/PDF 定位文本（Codex-native）")
+    x.add_argument("file", help="源文件 (.docx / .pdf)")
+    x.add_argument("--out", "-o", required=True,
+                   help="输出 ai-proofread.source.v1 JSON")
 
     # proofread
     p = sub.add_parser("proofread", aliases=["p"], help="单文件校对")
@@ -557,7 +722,12 @@ def main():
     w = sub.add_parser("writeback", aliases=["w"], help="DOCX 修订+批注回写")
     w.add_argument("docx", help="原始 Word 文档 (.docx)")
     w.add_argument("--findings", help="发现 JSON（自动搜索同目录 _max_results.json）")
-    w.add_argument("--out", help="输出路径（默认 <stem>_审阅版.docx）")
+    w.add_argument(
+        "--source-manifest",
+        help="proofread extract 生成的 ai-proofread.source.v1（绑定旧 findings）")
+    w.add_argument(
+        "--out",
+        help="输出路径（默认 output_<stem>/<stem>_审阅版.docx）")
     w.add_argument("--author", default="审校助手", help="修订作者名")
     w.add_argument("--engine", default="02", choices=["02", "adeu"],
                     help="回写引擎：02（默认，直接 OOXML）| adeu（MCP，旧方案）")
@@ -580,6 +750,8 @@ def main():
         "m": cmd_max,
         "writeback": cmd_writeback,
         "w": cmd_writeback,
+        "extract": cmd_extract,
+        "x": cmd_extract,
     }
     fn = cmd_map.get(args.command)
     if fn:

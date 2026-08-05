@@ -1,0 +1,4 @@
+interface:
+  display_name: "AI中文审校"
+  short_description: "审校中文Word和PDF并输出字符级修订批注与原页高亮标记"
+  default_prompt: "使用 $ai-proofread 审校指定的DOCX或PDF，保留原文件并验证输出。"
