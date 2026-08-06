@@ -25,6 +25,11 @@ class Token:
     priority: int
     raw_text: str
     number_value: Optional[int] = None
+    # markdown ATX 标题层级（`#` 数量）：setext === 为 1，普通文本行标题为 None。
+    # 有值时不替代 rule level 做"类型识别"，但在建树/层级校验时优先用它，
+    # 使「## 1. 概述」这类 H2 编号小节按作者意图作为"节"层级的二级标题，
+    # 不再因 rule 是"目"(level3) 而误报 hierarchy_gap。
+    heading_level: Optional[int] = None
 
 
 @dataclass

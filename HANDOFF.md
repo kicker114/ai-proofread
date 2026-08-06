@@ -77,7 +77,14 @@ P 编号三消费方逐段一致（1044 段字节级校验通过）。效果：*
   `(?=\D|$)` 前瞻防小数/日期误判；标题内容前可剥离括号/部卷前缀。3-agent 对抗
   验证（召回/精度/一致性）15 条 findings 已闭环：10 项修复、5 项为既有缺口
   记录（罗马占位、全角字符类、markdown 层级 vs 规则层级、合并标题只取首编号）。
-  回归测试 `tests/test_structure_scanner.py`（24 例）。
+  回归测试 `tests/test_structure_scanner.py`（30 例）。
+- **结构检查器已修「编号节」层级（第三项，commit 待提交）**：Token 加
+  `heading_level`（ATX `#` 数量 / setext 1 / 普通行 None），builder 建树与
+  `_check_hierarchy` 以 markdown 标题层级优先——「## 1. 概述」按作者意图作 H2
+  二级标题，不再误报 hierarchy_gap；真跳级（H1→H3）仍报；编号节跳号连续性仍
+  检查；setext 标题文本行两遍扫描预处理以 heading_level=1 参与建树（修复了普通行
+  先产出 None 导致 setext 章下 H2 编号节误报 level_mismatch 的问题）。穷举 8 种
+  层级组合 + 对抗 5 例 + 偏移切片一致性全部通过；合成稿确定性仍 64/5/2。
 
 ## Goal
 

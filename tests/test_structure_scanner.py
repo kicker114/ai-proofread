@@ -193,6 +193,17 @@ class ScannerUnitTests(unittest.TestCase):
         tokens2, _ = _tokens(text2)
         self.assertEqual(tokens2, [])
 
+    def test_setext_heading_level_1_so_h2_numbered_subsection_is_legal(self):
+        # setext 章（=== 作 H1）+ ## 1.（H2）编号节 → 无 level_mismatch
+        # （回归：普通行先产出 heading_level=None 的章 token 曾使此处误报）
+        text = "第一章 总论\n===\n## 1. 概述\n## 2. 详述\n"
+        result = check_text_with_rules(text, _RULES)
+        self.assertEqual(result.diagnostics, [])
+        # setext 章 token 应带 heading_level=1
+        tokens, _ = _tokens(text)
+        chapter = next(t for t in tokens if t.rule_id == "chapter")
+        self.assertEqual(chapter.heading_level, 1)
+
     def test_multi_digit_subsection(self):
         text = "### 12. 扩展内容\n"
         tokens, _ = _tokens(text)
@@ -245,6 +256,41 @@ class ScannerIntegrationTests(unittest.TestCase):
         )
         result = check_text_with_rules(text, _RULES)
         self.assertIn("hierarchy_gap", [d.kind for d in result.diagnostics])
+
+    def test_h2_numbered_subsection_under_chapter_is_legal(self):
+        # 修复核心：## 1. 编号小节按作者意图作为 H2（与 ## 第一节 同级），
+        # 不再因规则判定"目"=level3 而误报 hierarchy_gap
+        text = "# 第一章 引言\n## 1. 概述\n## 2. 详述\n"
+        result = check_text_with_rules(text, _RULES)
+        self.assertEqual(result.diagnostics, [])
+
+    def test_h1_to_h3_real_skip_still_reports_gap(self):
+        # 真跳级：# 第一章 直接 ### 1.（缺 H2）→ hierarchy_gap 仍报
+        text = "# 第一章 引言\n### 1. 直接目\n"
+        result = check_text_with_rules(text, _RULES)
+        self.assertIn("hierarchy_gap", [d.kind for d in result.diagnostics])
+
+    def test_section_and_numbered_subsection_same_h2_level(self):
+        # 章下混用 ## 第一节 与 ## 1.（同为 H2）→ 无诊断
+        text = ("# 第一章 引言\n"
+                "## 第一节 背景\n"
+                "## 1. 概述\n"
+                "## 2. 详述\n")
+        result = check_text_with_rules(text, _RULES)
+        self.assertEqual(result.diagnostics, [])
+
+    def test_numbered_subsection_jump_still_checked(self):
+        # 编号节 1→3 跳号：连续性检查不因修复而丢失
+        text = "# 第一章 引言\n## 1. 概述\n## 3. 详述\n"
+        result = check_text_with_rules(text, _RULES)
+        kinds = [d.kind for d in result.diagnostics]
+        self.assertIn("continuity_error", kinds)
+
+    def test_h2_numbered_subsection_with_h3_child_is_legal(self):
+        # 章 + ## 1.（H2）+ ### 2.（H3）：H2→H3 相邻 → 无诊断
+        text = "# 第一章 引言\n## 1. 概述\n### 2. 细目\n"
+        result = check_text_with_rules(text, _RULES)
+        self.assertEqual(result.diagnostics, [])
 
     def test_full_valid_tree_no_diagnostics(self):
         text = (

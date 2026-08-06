@@ -3,6 +3,16 @@ from typing import Dict, List, Tuple
 from .models import Diagnostic, Node, Rule, Token
 
 
+def _node_real_level(n: Node) -> int:
+    """节点真实层级：有 markdown 标题层级（`#` 数量）用它，否则用规则 level。
+
+    使「## 1. 概述」这类 H2 编号小节按作者意图作为二级标题，与「## 第一节」
+    同级，不再因规则判定其为"目"(level3) 而误报 hierarchy_gap。
+    """
+    h = n.token.heading_level
+    return h if h is not None else n.token.level
+
+
 def build_tree(tokens: List[Token], rule_map: Dict[str, Rule]) -> Tuple[List[Node], List[Diagnostic]]:
     nodes: List[Node] = [Node(token=t) for t in tokens]
     diags: List[Diagnostic] = []
@@ -11,7 +21,7 @@ def build_tree(tokens: List[Token], rule_map: Dict[str, Rule]) -> Tuple[List[Nod
 
     for node in nodes:
         # 清理无效 number 的情况：不致命，后续连续性检查会处理
-        while stack and node.level <= stack[-1].level:
+        while stack and _node_real_level(node) <= _node_real_level(stack[-1]):
             stack.pop()
         if not stack:
             roots.append(node)
@@ -58,32 +68,65 @@ def _check_hierarchy(
         node: Node,
         rule_map: Dict[str, Rule],
         diags: List[Diagnostic]) -> None:
-    """验证 parent→node 的嵌套关系是否符合规则声明的 children 层级。
+    """验证 parent→node 的嵌套关系是否符合标题层级。
 
     规则 JSON 中每个 level 的 `children` 字段声明了合法的直接子规则。
-    原实现完全忽略该字段，导致孤立「第三节」（无章）、或「目」直接嵌在「章」
-    下等层级问题静默通过。这里补上：
-      - 中间层级缺失（parent.level+1 < node.level）→ hierarchy_gap
-      - 同层/反序或不在 children 声明中 → level_mismatch
+    层级合法性判定优先用 markdown 标题层级（`#` 数量）：
+      - 「# 第一章」+「## 1. 概述」→ H1→H2 相邻，合法（作者用 H2 编号小节，
+        与「## 第一节」同级，不再因规则判定"目"=level3 而误报 gap）。
+      - 「# 第一章」+「### 1.」→ H1→H3 跳级 → hierarchy_gap（真实跳级仍报）。
+      - 「## 第一节」+「### 1.」→ H2→H3 相邻，合法。
+    双方都有 markdown 层级时按标题层级判定（作者意图优先）；任一方无
+    （普通文本行标题、setext）退回按规则 level + children 声明判定。
     """
     parent_rule = rule_map.get(parent.rule_id)
     node_rule = rule_map.get(node.rule_id)
     if parent_rule is None or node_rule is None:
         return  # 虚拟根或未知规则，跳过
 
+    parent_heading = parent.token.heading_level
+    node_heading = node.token.heading_level
+    p_lvl = parent_heading if parent_heading is not None else parent.level
+    n_lvl = node_heading if node_heading is not None else node.level
+
+    if parent_heading is not None and node_heading is not None:
+        # 双方都有明确标题层级：按标题层级判定（作者意图优先）
+        if n_lvl > p_lvl + 1:
+            diags.append(Diagnostic(
+                kind="hierarchy_gap",
+                message=f"{node_rule.name}（标题层级 H{n_lvl}）直接嵌套在 "
+                        f"{parent_rule.name}（H{p_lvl}）下，中间层级缺失",
+                position=(node.token.start, node.token.end),
+                extra={"rule": node.rule_id, "parent": parent.rule_id,
+                       "child_level": n_lvl, "parent_level": p_lvl,
+                       "heading": True},
+            ))
+        elif n_lvl <= p_lvl:
+            diags.append(Diagnostic(
+                kind="level_mismatch",
+                message=f"{node_rule.name}（H{n_lvl}）层级不应低于或等于 "
+                        f"{parent_rule.name}（H{p_lvl}）",
+                position=(node.token.start, node.token.end),
+                extra={"rule": node.rule_id, "parent": parent.rule_id,
+                       "child_level": n_lvl, "parent_level": p_lvl,
+                       "heading": True},
+            ))
+        return
+
+    # 任一方无 markdown 层级（普通文本行标题）→ 按规则 level + children 判定
     allowed_children = parent_rule.children
     if allowed_children and node.rule_id in allowed_children:
         return  # 合法直接子规则
 
     # 不合法嵌套
-    if node.level > parent.level + 1:
+    if n_lvl > p_lvl + 1:
         # 中间层级缺失（如 章→目，中间缺 节）
         diags.append(Diagnostic(
             kind="hierarchy_gap",
             message=f"{node_rule.name} 直接嵌套在 {parent_rule.name} 下，中间层级缺失",
             position=(node.token.start, node.token.end),
             extra={"rule": node.rule_id, "parent": parent.rule_id,
-                   "child_level": node.level, "parent_level": parent.level},
+                   "child_level": n_lvl, "parent_level": p_lvl},
         ))
     elif allowed_children:
         # 同层或反序嵌套，或不在声明范围内

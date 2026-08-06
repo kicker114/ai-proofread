@@ -40,13 +40,17 @@ def _match_rules(
         content: str, content_start: int,
         compiled: List[Tuple[Rule, "re.Pattern"]],
         require_space_after: bool,
-        plain_only_prefix: bool) -> List[Token]:
+        plain_only_prefix: bool,
+        heading_level: int | None = None) -> List[Token]:
     """对标题内容做锚定匹配（re.match 于内容起点，规则间互斥）。
 
     require_space_after=True：编号后必须是空白/EOL 才接受（用于无 `#` 的
       普通文本行，把"第三章 引言"标题与"第三章书评见附录"正文区分开）。
     plain_only_prefix=True：只允许"第X章/第X节"这类以"第"开头的规则参与
       普通行识别（裸数字"1."太歧义：列表/小数都不该在无 # 时算作小节）。
+    heading_level：markdown ATX 标题的 `#` 数量（setext 为 1，普通行为 None）。
+      有值时写入 Token，供 builder 建树时优先用它决定层级，避免规则层级
+      （如"目"=3）与作者标题层级（H2）冲突导致的误报。
     """
     content, content_start = _strip_decorators(content, content_start)
     out: List[Token] = []
@@ -69,6 +73,7 @@ def _match_rules(
             priority=rule.priority,
             raw_text=pm.group(0),
             number_value=num_val,
+            heading_level=heading_level,
         ))
     return out
 
@@ -97,22 +102,33 @@ def scan_text(text: str, rules: List[Rule]) -> Tuple[List[Token], List[Diagnosti
         (rule, re.compile(rule.pattern)) for rule in rules
     ]
 
+    lines = text.splitlines(keepends=True)
+
+    # 第一遍：标记 setext 标题文本行（其下一行是 ===；--- 与水平线歧义不支持）。
+    # 这样的行必须以 heading_level=1 参与建树——若让它在普通行分支以
+    # heading_level=None 先产出，后续「## 1.」嵌其下会因"任一方无标题层级"
+    # 退回规则检查而误报 level_mismatch。
+    setext_lines: set[int] = set()
+    for i in range(len(lines) - 1):
+        body = lines[i].rstrip("\r\n")
+        nxt = lines[i + 1].rstrip("\r\n")
+        if (body.strip() and _SETEXT_RE.match(nxt)
+                and _ATX_RE.match(body) is None):
+            setext_lines.add(i)
+
     in_fence = False
-    prev_line: Tuple[str, int] | None = None  # 上一条普通文本行（供 setext）
     line_start = 0
-    for line in text.splitlines(keepends=True):
+    for idx, line in enumerate(lines):
         body = line.rstrip("\r\n")
         fm = _FENCE_RE.match(body)
         if fm is not None:
             in_fence = not in_fence  # 开/关围栏
-            prev_line = None
             line_start += len(line)
             continue
         if in_fence:
             line_start += len(line)
             continue
         if not body.strip():
-            prev_line = None
             line_start += len(line)
             continue
 
@@ -120,25 +136,26 @@ def scan_text(text: str, rules: List[Rule]) -> Tuple[List[Token], List[Diagnosti
         if am is not None:
             content = am.group("content")
             content_start = line_start + am.start("content")
+            hashes = len(am.group("hashes"))  # markdown 标题层级（# 数量）
             tokens.extend(_match_rules(
                 content, content_start, compiled,
-                require_space_after=False, plain_only_prefix=False))
-            prev_line = None  # ATX 行后接下划线属异常，不参与 setext
+                require_space_after=False, plain_only_prefix=False,
+                heading_level=hashes))
+        elif idx in setext_lines:
+            # setext 标题文本行：作为 H1 参与建树
+            indent = len(body) - len(body.lstrip(" \t"))
+            tokens.extend(_match_rules(
+                body.strip(), line_start + indent, compiled,
+                require_space_after=False, plain_only_prefix=False,
+                heading_level=1))
         elif _SETEXT_RE.match(body):
-            if prev_line is not None:
-                pbody, pstart = prev_line
-                tokens.extend(_match_rules(
-                    pbody.strip(), pstart + (len(pbody) - len(pbody.lstrip())),
-                    compiled, require_space_after=False,
-                    plain_only_prefix=False))
-            prev_line = None
+            pass  # === 下划线行本身，其标题文本行已在上一行处理
         else:
             # 普通文本行：仅「第X章/第X节」行首锚定 + 编号后空白
-            line_tokens = _match_rules(
+            tokens.extend(_match_rules(
                 body, line_start, compiled,
-                require_space_after=True, plain_only_prefix=True)
-            tokens.extend(line_tokens)
-            prev_line = None if line_tokens else (body, line_start)
+                require_space_after=True, plain_only_prefix=True,
+                heading_level=None))
 
         line_start += len(line)
 
