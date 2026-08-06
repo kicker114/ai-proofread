@@ -112,7 +112,8 @@ proofread extract 书稿.pdf --out 书稿_review_source.json
 一条命令串联全部审校环节，产物：
 - `{doc}_refined.md` — 精修版全文（保持原格式，精准句改）
 - `{doc}_max_results.json` — 全阶段 findings（Word 来源时含源 SHA-256）
-- `{doc}_max_report.html` — 综合报告（聚合全部阶段）
+- `{doc}_max_report.html` — 综合报告（**V3 深色主题**：原文内嵌红色高亮错误词、
+  按章节分组、严重级别徽章、建议与说明）
 - `{doc}_alignment.html` — 句子级对齐勘误表
 
 ### 管线各阶段
@@ -145,6 +146,14 @@ proofread extract 书稿.pdf --out 书稿_review_source.json
 2. 段间空行：一个或连续多个空行表示分段
 
 没有标题时程序随机选择切分位置；段间没有空行可能导致切分过长、效果变差。
+分块器现在对无空行连续文本按句子边界（`。！？；…`）硬切，避免退化成超大块。
+
+**.docx（含 altChunk 格式）**：除标准 `w:p` 段落外，原生支持 PDF→Word 导出 /
+腾讯文档产出的 **altChunk（内嵌 MHT）** 格式——正文嵌在 `word/*.mht` 里、没有
+`w:p`。`extract_source` 提供共享 MHT 解析器（multipart + quoted-printable/base64 +
+字符集）与 `docx_uses_altchunk_body` 判定，DOCX→MD、P 编号映射、02 引擎回写
+三处消费方 P 编号严格一致，可直接 `proofread m my.docx --writeback` 得到完整修订+
+批注的 `_审阅版.docx`。旧版依赖 LibreOffice 中转，现已免中转。
 
 **PDF**：原生支持。`src/pdf_pipeline.py pdf2md` 直接转 Markdown + 审校后 PyMuPDF 高亮批注回写（见下方「PDF 审校工具链」）。
 
@@ -218,6 +227,25 @@ proofread m  <docx>  --writeback [--author NAME]
 `--findings` 不传时自动搜索同目录 `_max_results.json`。新版 Word max 结果自带源哈希；
 旧版无哈希结果必须传 `--source-manifest`。`--out` 始终另存；输出完成后会审计
 DOCX ZIP/XML、修订文本、批注 ID 和包关系，失败或全部发现均无法定位时命令返回非零状态。
+
+---
+
+## 性能与成本（长稿实测 2026-08-06）
+
+Phase 1（LLM JSON 发现模式）是唯一耗时/成本瓶颈：16 万字书稿在默认
+`--concurrent 3 --rpm 15` 下耗时 **~3 小时**，实测 token 消耗约 235 万
+（输入 94% / 输出 6%），成本约 ¥5。
+
+**推荐长稿参数（提速约 5 倍，质量不变）：**
+
+```zsh
+proofread m 书稿.md --no-view --concurrent 8 --rpm 60
+```
+
+- 并发不影响审校质量——每个 chunk 是独立、同 prompt 的调用。
+- 三处 token 优化已内置：`max_tokens=4096`（JSON 发现模式）、context 裁剪
+  （每块只带章节标题 + target 前后 800 字，token 降 38%）、无空行句子硬切。
+- 详情见 `CLAUDE.md` 的 Performance tuning 章节。
 
 ---
 
@@ -304,12 +332,15 @@ python3 -m unittest \
   tests.test_extract_source \
   tests.test_codex_entry \
   tests.test_pdf_pipeline \
-  tests.test_word_writeback
+  tests.test_word_writeback \
+  tests.test_altchunk \
+  tests.test_splitter_context
 ```
 
 测试覆盖 Codex Skill、DOCX 表格提取、findings 哈希门禁、Word OOXML 修订批注、
-PDF quads/歧义/降级策略以及输入文件防覆盖。旧的 `test_performance.py` 和
-`test_two_stage.py` 仍引用已移除的 `src.sentence_aligner_simple`，不属于当前回归门。
+PDF quads/歧义/降级策略、**altChunk（MHT 嵌入）DOCX 全管线**、**分块 context
+裁剪**以及输入文件防覆盖。旧的 `test_performance.py` 和 `test_two_stage.py` 仍
+引用已移除的 `src.sentence_aligner_simple`，不属于当前回归门。
 
 ---
 

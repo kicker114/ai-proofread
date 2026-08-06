@@ -225,6 +225,7 @@ The old **Adeu MCP** path (`src/writeback.py`, `--engine adeu`) requires Claude 
 | `src/pdf_pipeline.py` | PDF toolchain: `pdf2md` (pymupdf4llm) + `annotate` (PyMuPDF highlight writeback on original PDF) |
 | `src/sentence_aligner.py` | Anchor-based sentence alignment with Jaccard n-gram similarity |
 | `src/html_report_v2.py` | HTML report rendering for alignment and max reports |
+| `src/html_report_v3.py` | V3 dark-theme report: inline error highlighting, chapter grouping, severity badges (used by `phase4_report`) |
 | `src/diff_tools.py` | HTML word-level diff generation via difflib |
 | `src/special_checker/` | TGSCC character check, MDict lookup, checker/NGram model, fuzzy text matching |
 | `src/structure_checker/` | Heading hierarchy + numbering continuity validation (scanner → builder → rules) |
@@ -292,9 +293,31 @@ walker. Heading styles (`Heading 1`–`9`) become `#`–`#########`. Body and
 table-cell paragraphs are emitted in document order so table text is not
 silently omitted. The `.md` is written adjacent to the source `.docx`.
 
+### altChunk (MHT-embedded) DOCX support
+
+PDF→Word converters and Tencent Docs export `.docx` whose body is a single
+`<w:altChunk>` (no standard `w:p`) — all text lives in an embedded MHT file.
+Without special handling, DOCX→MD yields empty text, the P-map is empty, and
+writeback silently skips. Support lives in `src/extract_source.py`:
+
+- `extract_altchunk_paragraphs(archive)` — robust MHT decoder (multipart
+  boundary split → `Content-Type: text/html` part → quoted-printable / base64
+  decode → declared charset) + HTML→paragraphs with heading levels.
+- `materialize_altchunk_paragraphs(body, paras)` — converts to real `w:p` for
+  the writeback engine.
+- `docx_uses_altchunk_body(archive)` — **shared predicate** the three consumers
+  (extract_docx_units, `_build_para_text_map`, writeback_engine.main) use to
+  decide "body fully MHT-carried". It ignores empty `<w:p/>` placeholders and
+  requires **text-bearing** paragraphs to fall back to the standard walk, so
+  mixed docs (native `w:p` + altChunk) are handled identically by all three and
+  the altChunk content is never silently dropped or relocated.
+
+P-numbering stays consistent because all three consumers feed off the same
+ordered paragraph list. See `tests/test_altchunk.py`.
+
 ## Important constraints
 
-- **P-numbering consistency**: Any change to `_para_raw_text()` or paragraph walking logic in `writeback_engine.py` must be mirrored exactly in `max_pipeline._build_para_text_map()`. They are deliberately duplicated — do NOT refactor into a shared function unless you also update all `P{n}` resolution code.
+- **P-numbering consistency**: Any change to `_para_raw_text()` or paragraph walking logic in `writeback_engine.py` must be mirrored exactly in `max_pipeline._build_para_text_map()`. They are deliberately duplicated — do NOT refactor into a shared function unless you also update all `P{n}` resolution code. The one intentional exception is the altChunk predicate `extract_source.docx_uses_altchunk_body()` — all three consumers call this shared helper, and the guard drift between them (e.g. `p` vs `p,tbl`, empty `<w:p/>` handling) was a real bug fixed in commit `5f42b38`.
 - **Prompt files**: Two distinct system prompts in `src/resource/` — the JSON discovery prompt is used by max pipeline Phase 1; the rewrite prompt is used by `proofread p` and `proofread b`. Do not swap them.
 - **Python ≥ 3.10 required** (uses `str | None` union syntax).
 - **No pytest/conftest** — new regression tests use `unittest` and must remain directly runnable from `tests/`.

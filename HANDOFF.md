@@ -2,9 +2,53 @@
 
 **Scope:** `/Users/kicker114/Developer/ai-proofread`
 **Branch / HEAD:** `main` / current committed HEAD
-**Status:** Codex 入口、Word 字符级修订批注、PDF 高亮批注均已实现并完成专项验收；本次实现已提交。
+**Status:** Codex 入口、Word 字符级修订批注、PDF 高亮批注均已实现并完成专项验收；2026-08-06 追加 altChunk 原生支持、V3 报告、性能优化，全部已提交。
 
 > 工作树原有 `.workbuddy/memory/2026-08-05.md` 用户修改。本次实现没有编辑该文件，后续提交时不要把它当成本次产物覆盖或回退。
+
+## 2026-08-06 技术更新（本日新增）
+
+### altChunk（PDF→Word / 腾讯文档）DOCX 原生支持
+
+问题：PDF→Word 转换器和腾讯文档导出的 `.docx` 正文是单个 `<w:altChunk>`
+（无标准 `w:p`），全文嵌在 `word/*.mht` 里。此前 DOCX→MD 产出空文本、P-map
+为空、写回静默跳过——纯 Word 稿件正常，altChunk 格式整条管线失效。
+
+修复（`src/extract_source.py`，commit `6006c75` + `5f42b38`）：
+
+- `extract_altchunk_paragraphs(archive)`：健壮 MHT 解码（multipart 边界 →
+  `Content-Type: text/html` 段 → quoted-printable / base64 → 声明字符集 GBK/
+  UTF-8）+ HTML→段落（含标题层级）。
+- `materialize_altchunk_paragraphs(body, paras)`：物化为标准 `w:p` 供引擎回写。
+- `docx_uses_altchunk_body(archive)`：**共享判定**——三消费方（extract_docx_units、
+  `_build_para_text_map`、writeback_engine.main）用它决定「正文是否完全由 MHT 承载」。
+  忽略空 `<w:p/>` 占位，要求有文本承载才退回标准 walk；混合文档三处一致走标准
+  walk，altChunk 内容不静默丢弃、不重排。
+- 对抗性审查（4-agent 工作流）修复了守卫漂移、顶层 import 崩溃、缺 rels part
+  KeyError、base64/GBK 解码。
+
+P 编号三消费方逐段一致（1044 段字节级校验通过）。效果：**无需 LibreOffice 中转**，
+`proofread m my.docx --writeback` 直接产出完整修订+批注的 `_审阅版.docx`（实测 1543
+字符级修订 + 1598 批注，OOXML 审计通过，LibreOffice 打开正常）。
+
+### V3 深色主题审校报告（`src/html_report_v3.py`）
+
+替代旧版表格视图：深色主题、统计卡片（必须修改/建议修改/供参考）、按 Markdown
+标题自动分组、**原文内嵌红色高亮错误词**（location 定位上下文）、绿色建议、说明。
+`max_pipeline.phase4_report` 委托给它，输出仍为 `{doc}_max_report.html`。
+
+### 性能优化（长稿 token 能效）
+
+实测 16 万字书稿 Phase 1 耗时 11321s（≈3h），token 约 235 万，成本约 ¥5。
+瓶颈：每块携带整段 context（冗余 18.3×）、默认并发 3 + rpm 15 限流、无 max_tokens。
+
+优化（commit `3cb922a` + `67c143e`）：
+- `max_tokens=4096`（仅 JSON 发现模式）。
+- `splitter.build_local_context()`：context 裁剪为章节标题 + target 前后各 800 字
+  （上限 3000），token 降 38%。
+- `cut_text_by_length()`：无空行连续文本按句子边界（`。！？；…`）硬切，不退化超大块。
+- 建议参数 `--concurrent 8 --rpm 60`（约 1h，提速 5 倍）。并发不影响质量。
+- 新增 `tests/test_splitter_context.py`。
 
 ## Goal
 
@@ -88,6 +132,9 @@ Word max 在审校前记录源 DOCX 哈希并写入 `_max_results.json`，Phase 
 
 DOCX→Markdown 和 `proofread extract` 都按正文/表格实际顺序输出，P 编号与 02 引擎一致。
 
+altChunk（内嵌 MHT）docx：引擎在 `docx_uses_altchunk_body` 判定为真时物化 altChunk
+为 `w:p` 再 walk——P 编号与 `extract_docx_units` / `_build_para_text_map` 逐段一致。
+
 ## PDF Engine
 
 `src/pdf_pipeline.py` 现在：
@@ -109,10 +156,12 @@ python3 -m unittest \
   tests.test_extract_source \
   tests.test_codex_entry \
   tests.test_pdf_pipeline \
-  tests.test_word_writeback
+  tests.test_word_writeback \
+  tests.test_altchunk \
+  tests.test_splitter_context
 ```
 
-- 39/39 tests passed。
+- 57/57 tests passed（39 原专项 + 11 altChunk + 7 splitter context）。
 - Skill `quick_validate.py` passed。
 - fresh `codex exec --ephemeral -s read-only` 自动识别 `$ai-proofread`、默认 `pipeline`、02 引擎和源文件只读约束。
 - `python3 -m compileall`、`git diff --check` passed。
@@ -155,12 +204,17 @@ python3 -m unittest \
 - Codex：`AGENTS.md`、`.agents/skills/ai-proofread/`。
 - Interfaces：`src/extract_source.py`、`src/cli.py`、`pyproject.toml`。
 - Engines：`src/writeback_engine.py`、`src/max_pipeline.py`、`src/pdf_pipeline.py`。
-- Tests：四个 `tests/test_*` Codex/Word/PDF 回归文件。
+- 2026-08-06 新增：`src/html_report_v3.py`（V3 报告）、`src/extract_source.py` altChunk
+  解析器/物化器/共享判定、`src/splitter.py` context 裁剪 + 无空行硬切、
+  `src/proofreader.py` `max_tokens`。
+- Tests：四个 `tests/test_*` Codex/Word/PDF 回归文件 + `tests/test_altchunk.py` +
+  `tests/test_splitter_context.py`。
 - Docs：`README.md`、`CLAUDE.md`、`HANDOFF.md`、`.workbuddy/agents/pdf-proofreader.md`。
 
 ## Next Safe Action
 
-1. 先运行上面的 39 项专项回归。
+1. 先运行上面的 57 项专项回归。
 2. 检查 `git diff --check` 和 `git status --short`。
 3. 提交时保留用户原有 `.workbuddy/memory/2026-08-05.md` 修改，不回退，也不要误称为本次实现。
 4. 对新的真实稿件始终先生成审校源/哈希；PDF 必须先 dry-run。
+5. 长稿审校用 `--concurrent 8 --rpm 60`（实测提速 5 倍，质量不变）。
