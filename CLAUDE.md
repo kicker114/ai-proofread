@@ -252,6 +252,30 @@ Google models (gemini-*)
 
 `temperature` is hardcoded at 1.3 (tuned for proofreading — lower values reduce edits too much).
 
+### Performance tuning (measured 2026-08-06)
+
+`proofread max` Phase 1 (LLM JSON discovery) is the wall-clock bottleneck — for a
+16万字 book it took 11321s (≈3h) at the old defaults. Pure-Word and altChunk
+runs have identical API cost; misreports do not affect duration.
+
+**Recommended for book-length files:**
+
+```zsh
+proofread m 书稿.md --no-view --concurrent 8 --rpm 60
+```
+
+- `--concurrent 8`: 8 parallel API calls (default 3 serializes the loop).
+- `--rpm 60`: per-minute cap (default 15 throttles hard — measured 3× slowdown).
+- Rough estimate: 16万字 / 500 chunks ≈ **1h** at 8/60, vs 3h at 3/15.
+- `--concurrent 12 --rpm 90` ≈ 40min, but watch for API 429 — retries hard-wait.
+
+Concurrency **never affects output quality** — each chunk is an independent,
+identically-prompted call. Only API quota / 429s are the practical ceiling.
+
+**`max_tokens=4096`** is passed explicitly in `max_pipeline._proofread_one_json`
+(JSON discovery mode only) to cap per-call output. The default `deepseek()`
+callers (`proofread p/b` full rewrite, `lookup_mdict`) pass `None` = unlimited.
+
 ### DOCX→MD conversion
 
 Done inline in `cli.py._docx_to_md()` through `extract_source`'s lxml OOXML

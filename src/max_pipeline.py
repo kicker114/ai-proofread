@@ -492,8 +492,11 @@ async def _proofread_one_json(
 
     await rate_limiter.wait()
     sys_prompt = load_system_prompt("json")
+    # JSON 发现模式：限制输出上限，避免模型生成超长 JSON 拖慢审校（见 CLAUDE.md）
     result = await asyncio.get_event_loop().run_in_executor(
-        None, lambda: deepseek(post_text, pre_text, model, system_prompt=sys_prompt))
+        None, lambda: deepseek(
+            post_text, pre_text, model,
+            system_prompt=sys_prompt, max_tokens=4096))
 
     if not result:
         print(f"  ⚠️  chunk {index}/{total}: 返回空", file=sys.stderr)

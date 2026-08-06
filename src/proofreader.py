@@ -57,9 +57,12 @@ class RateLimiter:
             self.last_call_time = time.time()
 
 
-def deepseek(content: str, reference: str="", model:str="deepseek-v4-flash", system_prompt: str|None = None) -> str|None:
+def deepseek(content: str, reference: str="", model:str="deepseek-v4-flash", system_prompt: str|None = None, max_tokens: int|None = None) -> str|None:
     """
     调用各家deepseek校对模型，返回校对后的文本
+
+    max_tokens: 输出上限。None（默认）= 不限制。JSON 发现模式（max 管线 Phase 1）
+    会显式传 4096 防止超长 JSON 拖慢审校；全稿重写（proofread p/b）保持不限。
 
     model: deepseek-v4-flash (默认)
            deepseek-v4-pro
@@ -105,12 +108,15 @@ def deepseek(content: str, reference: str="", model:str="deepseek-v4-flash", sys
     while retry_count < 3:
         try:
             print(f"正在调用 {model} API (尝试 {retry_count+1}/3)...")
-            response = client.chat.completions.create(
+            kwargs = dict(
                 model=model,
-                messages=message, # type: ignore
+                messages=message,  # type: ignore
                 temperature=1.3,
                 stream=False,
             )
+            if max_tokens:
+                kwargs["max_tokens"] = max_tokens
+            response = client.chat.completions.create(**kwargs)
             result = response.choices[0].message.content
             if result:
                 break
