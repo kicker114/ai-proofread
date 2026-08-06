@@ -5,40 +5,74 @@
 import re
 from typing import List, Tuple
 
+_SENT_END = "。！？；!?;…"
+
+def _split_oversized(joined: str, cut_by: int) -> tuple[str, str]:
+    """把超长片段按句子边界硬切为 (前块, 剩余)。
+
+    在 [cut_by*0.5, cut_by*1.5] 窗口内往回找最近的句子结束符；
+    无句子边界则按 cut_by 硬切。
+    """
+    lo = int(cut_by * 0.5)
+    hi = min(len(joined), int(cut_by * 1.5))
+    split_at = -1
+    for pos in range(hi, lo - 1, -1):
+        if joined[pos - 1:pos] in _SENT_END:
+            split_at = pos
+            break
+    if split_at == -1:
+        split_at = cut_by
+    return joined[:split_at], joined[split_at:]
+
+
 def cut_text_by_length(text: str, cut_by: int=600) -> List[str]:
     """
-    将文本大致按长度切分（在指定长度前后最近一个空行处）
+    将文本大致按长度切分。
+
+    优先在空行处切分（保留原行为）；若文本无空行（如 DOCX→MD 单段连续文本）
+    导致块过度膨胀，则退化为按长度在最近的句子边界硬切，保证每块大小可控。
 
     Args:
         text (str): 文本
-        length (int): 长度
+        cut_by (int): 目标块长度
 
     Returns:
         List[str]: 切分后的文本列表
     """
     # 如果length小于50，则按50字切分
     cut_by = 50 if cut_by < 50 else int(cut_by)
-    # 按行分割文本
     lines = text.splitlines()
 
-    # 存储切分后的文本
     result = []
-    current_chunk = []
+    current_chunk: List[str] = []
     current_length = 0
 
     for line in lines:
         current_chunk.append(line)
         current_length += len(line)
 
-        # 如果当前块长度超过目标长度且遇到空行,则切分
+        # 空行且超长 → 切分（原逻辑，空行是自然段落边界）
         if current_length >= cut_by and not line.strip():
             result.append('\n'.join(current_chunk))
             current_chunk = []
             current_length = 0
+        # 无空行但严重超长（>= 1.5×cut_by）→ 句子边界硬切，防大块
+        elif current_length >= cut_by * 1.5 and line.strip():
+            joined = '\n'.join(current_chunk)
+            piece, rest = _split_oversized(joined, cut_by)
+            result.append(piece)
+            current_chunk = [rest] if rest else []
+            current_length = len(rest)
 
-    # 添加最后一个块
-    if current_chunk:
-        result.append('\n'.join(current_chunk))
+    # 循环后剩余可能仍超长（单行大文本无后续行触发切分）→ 反复硬切
+    while current_chunk:
+        joined = '\n'.join(current_chunk)
+        if len(joined) <= cut_by * 1.5:
+            result.append(joined)
+            break
+        piece, rest = _split_oversized(joined, cut_by)
+        result.append(piece)
+        current_chunk = [rest] if rest else []
 
     return result
 
@@ -105,24 +139,57 @@ def split_markdown_by_title(text: str, levels: List[int]=[2]) -> List[str]:
 
     return raw_paragraphs
 
-def split_markdown_by_title_and_length_with_context(text: str, levels: List[int]=[2], cut_by: int=600) -> List[dict]:
+def build_local_context(
+        paragraph: str, target: str,
+        context_pad: int = 800, max_context: int = 3000) -> str:
+    """从段落中提取 target 前后的本地上下文，避免整段重复传输。
+
+    原实现把整段（可能几千字）作为每块的 context，16万字书稿实测 context
+    token 冗余达 18.3×。裁剪后只保留：
+      - 段落开头的章节标题（供模型判断章节语境与格式）；
+      - target 前 / 后各 context_pad 字（供指代与前后文参照）。
+
+    context 不包含 target 本身（target 单独放 <target>，避免重复）。
+    若 target 未定位到（异常），退回段落前 max_context 字。
+    """
+    idx = paragraph.find(target)
+    if idx == -1:
+        return paragraph[:max_context]
+
+    before = paragraph[max(0, idx - context_pad):idx]
+    after = paragraph[idx + len(target): idx + len(target) + context_pad]
+    ctx = before.rstrip() + "\n" + after.lstrip()
+
+    # 保留章节标题（若在裁剪范围外则补到前部）
+    first_line = paragraph.split("\n", 1)[0].strip()
+    if first_line.startswith("#") and first_line not in ctx:
+        ctx = first_line + "\n" + ctx
+
+    return ctx[:max_context]
+
+
+def split_markdown_by_title_and_length_with_context(
+        text: str, levels: List[int] = [2], cut_by: int = 600,
+        context_pad: int = 800, max_context: int = 3000) -> List[dict]:
     """
     1. 将markdown文本按标题级别切分;
     2. 再按cut_by字符切分，作为target；
-    3. 保留完整上下文，作为context；
+    3. 保留target前后的本地上下文，作为context（不再带整段）。
     """
     # 按标题切分文本
     raw_paragraphs = split_markdown_by_title(text, levels=levels)
 
-    # 长文本按cut_by字符切分，并添加target标签并保留上下文
+    # 长文本按cut_by字符切分，并为每个 target 构建本地上下文
     label_paragraphs = []
     for paragraph in raw_paragraphs:
         pieces = cut_text_by_length(paragraph, cut_by=cut_by)
         new_pieces = []
-        # 为每个片段添加target标签并保留上下文
+        # 为每个片段添加target标签并保留本地上下文
         for piece in pieces:
             dict_piece = {
-                'context': paragraph,
+                'context': build_local_context(
+                    paragraph, piece, context_pad=context_pad,
+                    max_context=max_context),
                 'target': piece,
             }
             new_pieces.append(dict_piece)

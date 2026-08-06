@@ -276,6 +276,15 @@ identically-prompted call. Only API quota / 429s are the practical ceiling.
 (JSON discovery mode only) to cap per-call output. The default `deepseek()`
 callers (`proofread p/b` full rewrite, `lookup_mdict`) pass `None` = unlimited.
 
+**Context trimming** (in `splitter.split_markdown_by_title_and_length_with_context`):
+each chunk previously carried the ENTIRE paragraph as `context` — measured 18.3×
+input-token redundancy. Now `build_local_context()` keeps only the chapter title +
+`context_pad` (default 800) characters on each side, capped at `max_context`
+(3000). Also `cut_text_by_length()` hard-splits text with no blank lines at
+sentence boundaries (`_SENT_END = 。！？；!?;…`), so DOCX→MD continuous text no
+longer degenerates into one giant chunk. Net effect on a 16万字 book: input tokens
+−38%, and sentence-complete chunks. Test: `tests/test_splitter_context.py`.
+
 ### DOCX→MD conversion
 
 Done inline in `cli.py._docx_to_md()` through `extract_source`'s lxml OOXML
