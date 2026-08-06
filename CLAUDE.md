@@ -244,7 +244,7 @@ The old **Adeu MCP** path (`src/writeback.py`, `--engine adeu`) requires Claude 
 - **TGSCC data**: `src/resource/tgscc_data.json` — General Standard Chinese Characters table
 - **Word-form dictionaries**: `reliable-proofreading-data/` — xh7_compressed + yixingci data
 - **MDict dictionaries** (optional, for `--names`): external `.mdx` files, paths configured in `max_pipeline.py` `DICT_PATHS` dict
-- **Structure rules**: `src/structure_checker/rules.example.json` — defines heading patterns and numbering rules
+- **Structure rules**: `src/structure_checker/rules.example.json` — defines heading patterns and numbering rules. `scanner.py` 只识别 markdown 标题（ATX `#` 可无空格/全角空格/BOM 容忍、setext `===`、无 `#` 的"第X章 标题"行首锚定 + 编号后空白），跳过代码围栏，不再全文正则扫描（正文"在第二章中"/"12.9亿"不再误报）。`N.` 小节规则含 `(?=\D|$)` 前瞻防小数/日期误判。已知既有缺口：罗马占位「第X章」→10、全角数字/句点字符类仅 ASCII、markdown 层级与规则层级脱钩（「## 1.」当目报 hierarchy_gap）、合并标题「第1章 第1节」只取首编号。
 
 ### Model routing in `proofreader.py`
 
