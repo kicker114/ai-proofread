@@ -332,6 +332,7 @@ def generate_report(
     docname: str = "",
     model: str = "",
     extra: str = "",
+    skipped: Optional[List[Dict]] = None,
 ) -> str:
     """生成 V3 版深色主题审校报告。
 
@@ -375,6 +376,14 @@ def generate_report(
 
     # ── 渲染各部分 ──
     stats_html = _render_stats_cards(all_findings)
+    skipped_banner = ""
+    if skipped:
+        skipped_banner = (
+            f'<div class="skipped-note">⚠️ 本次有 <strong>{len(skipped)}</strong> 条'
+            f' 发现被跳过/未定位（原句=改句、匹配率过低或无法唯一定位），未进入'
+            f' 修订与批注。详见 <code>{html.escape(docname or "书稿")}_skipped.json</code>'
+            f' 可人工复核。</div>'
+        )
 
     chapter_sections = []
     # 保持章节顺序
@@ -428,6 +437,17 @@ def generate_report(
     .sev-high {{ color: #ef4444; }}
     .sev-medium {{ color: #f59e0b; }}
     .sev-low {{ color: #3b82f6; }}
+
+    /* 被跳过发现提示 */
+    .skipped-note {{
+      margin: 0 0 20px; padding: 12px 16px;
+      background: #2a2118; border: 1px solid #7c5a2e;
+      border-radius: 8px; color: #e8c37a; font-size: 14px; line-height: 1.7;
+    }}
+    .skipped-note code {{
+      background: #1a1e2e; padding: 2px 6px; border-radius: 4px;
+      color: #e2e6f3; font-size: 12px;
+    }}
 
     /* 章节 */
     .chapter {{ margin-bottom: 24px; }}
@@ -499,6 +519,8 @@ def generate_report(
 
 {stats_html}
 
+{skipped_banner}
+
 {chapters_html if chapters_html else '<div class="empty">未发现问题 🎉</div>'}
 
   </div>
@@ -521,7 +543,8 @@ def phase4_report_v3(
         tgscc: List[Dict], variants: List[Dict], structure: List[Dict],
         llm: List[Dict], align: Optional[Dict] = None,
         names: Optional[List[Dict]] = None,
-        model: str = "", extra: str = "") -> str:
+        model: str = "", extra: str = "",
+        skipped: Optional[List[Dict]] = None) -> str:
     """兼容 max_pipeline.phase4_report() 签名的新版报告生成器。"""
     import os
     os.makedirs(out_dir, exist_ok=True)
@@ -531,4 +554,5 @@ def phase4_report_v3(
         tgscc=tgscc, variants=variants, structure=structure,
         llm=llm, names=names, align_stats=align.get("stats") if align else None,
         output_path=out_path, docname=docname, model=model, extra=extra,
+        skipped=skipped,
     )

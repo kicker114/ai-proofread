@@ -40,15 +40,39 @@ P 编号三消费方逐段一致（1044 段字节级校验通过）。效果：*
 ### 性能优化（长稿 token 能效）
 
 实测 16 万字书稿 Phase 1 耗时 11321s（≈3h），token 约 235 万，成本约 ¥5。
-瓶颈：每块携带整段 context（冗余 18.3×）、默认并发 3 + rpm 15 限流、无 max_tokens。
+瓶颈：模型推理和分块调用数量仍是主耗时；默认并发 3 + rpm 15 保守限流。max 现在使用本地 context 裁剪、共享 client/线程池、300 秒超时、显式重试和按源哈希绑定的原子 checkpoint。
 
 优化（commit `3cb922a` + `67c143e`）：
 - `max_tokens=4096`（仅 JSON 发现模式）。
 - `splitter.build_local_context()`：context 裁剪为章节标题 + target 前后各 800 字
   （上限 3000），token 降 38%。
 - `cut_text_by_length()`：无空行连续文本按句子边界（`。！？；…`）硬切，不退化超大块。
-- 建议参数 `--concurrent 8 --rpm 60`（约 1h，提速 5 倍）。并发不影响质量。
+- 安全默认保持 `--concurrent 3 --rpm 15 --chunk-size 200`。在固定 120 段样本通过召回/精确率门禁前，不提高并发/RPM，也不改变默认分块。
+- max 第二次运行只补失败或 hash 不匹配的块；合法 `issues: []` 计为完成。阶段统计记录调用、重试、限速等待、checkpoint 命中和 wall time。
 - 新增 `tests/test_splitter_context.py`。
+
+### 跳过发现可见性 + book 路径可靠性 + 固定样本（2026-08-06 晚）
+
+针对 Codex 性能诊断文档的专项整改（Layer A/B 静默丢弃、book 路径 O(N²)）：
+
+- **跳过发现可见性**：`phase1_json_proofread` 统计 `findings_from_llm` /
+  `dropped_match`；`_resolve_findings_to_p` 新增 `skip_log` 参数记录丢弃原因
+  （`duplicate_anchor` / `fuzzy_tie` / `p_out_of_range` / `explicit_p_not_found` /
+  `not_found` / `empty_key_text`）。`run_max` 把 Layer A + B 丢弃统一原子落盘
+  `{doc}_skipped.json`（`ai-proofread.skipped.v1`），V3 报告顶部显示被跳过横幅。
+  被丢弃的发现不再静默消失。
+- **book 路径可靠性**（`process_paragraphs_async`）：每段独立侧车原子 checkpoint
+  （`{out}.chunks/{i:06d}.json`，O(1) 写，去掉整份 JSON 读改写的 O(N²) 与全局锁）；
+  失败段记 `*.error.json`；结束时若有失败抛 `RuntimeError`（CLI 非零退出）；重跑
+  只补缺失段；提示生产改用 `proofread max`。
+- **新增测试**：`tests/test_skip_visibility.py`（5 例）、`tests/test_book_path.py`（3 例）。
+- **可复用固定样本**：`samples/审校合成稿.md`（1806 字，确定性错误 TGSCC 64 /
+  异形词 5 / 结构 2 + 五类 LLM 陷阱：边界、跨段指代、需上下文事实、重复锚点、
+  同形异义词）+ `samples/审校合成稿_错误清单.md`（参考答案与复测方法）+
+  `samples/validate_synthetic.py`（确定性阶段秒级回归）。
+- **QA 发现（未修，待定）**：`phase0_structure` 对全文正则扫描（`第X章`/`N.`），
+  正文含"在第二章中""12.9亿"会产生结构误报；本样本已规避，真实书稿需注意，
+  建议后续改为只扫 markdown 标题行。
 
 ## Goal
 

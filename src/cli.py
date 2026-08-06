@@ -328,10 +328,15 @@ def cmd_max(args):
     """最大化检查：确定性检查 + LLM 审校 + 句子对齐 + 综合报告 + 可选 DOCX 回写。"""
     from .max_pipeline import run_max
 
+    if args.chunk_size <= 0:
+        print("❌ --chunk-size 必须是正整数")
+        sys.exit(2)
+
     results = run_max(
         args.file, model=args.model, concurrent=args.concurrent,
         rpm=args.rpm, run_names=args.names, verbose=args.verbose,
-        writeback=args.writeback, author=args.author)
+        writeback=args.writeback, author=args.author,
+        chunk_size=args.chunk_size)
 
     # 自动打开 master 报告
     if not args.no_view and results.get("report_path"):
@@ -712,6 +717,8 @@ def main():
     m.add_argument("--model", default=DEFAULT_MODEL, choices=AVAILABLE_MODELS)
     m.add_argument("--concurrent", type=int, default=3, help="LLM 并发数 (默认 3)")
     m.add_argument("--rpm", type=int, default=15, help="API 速率限制 (默认 15)")
+    m.add_argument("--chunk-size", type=int, default=200,
+                   help="每块目标字数 (默认 200)")
     m.add_argument("--names", action="store_true", help="启用专名查词（MDict 词典）")
     m.add_argument("--writeback", action="store_true",
                     help="审校完成后自动回写 DOCX（修订+批注）")

@@ -27,6 +27,7 @@ max_pipeline.py — ai-proofread 最大化检查模式
 """
 
 import asyncio
+import hashlib
 import html
 import json
 import os
@@ -41,6 +42,7 @@ from typing import Any, Dict, List, Optional
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _DATA_DIR = _PROJECT_ROOT / "reliable-proofreading-data"
 _RES_DIR = Path(__file__).resolve().parent / "resource"
+MAX_CHECKPOINT_SCHEMA = "ai-proofread.max-checkpoint.v1"
 
 DICT_PATHS = {
     "xianhan": "/Users/kicker114/Downloads/辞典/常用词典/现代汉语词典第7版/现代汉语词典第7版.mdx",
@@ -81,7 +83,7 @@ def _save_findings(path: str, results: Dict[str, Any]) -> None:
         for key in ("tgscc", "variants", "structure", "llm", "names")
         if isinstance(results.get(key, []), list)
     }
-    for key in ("source_path", "source_sha256"):
+    for key in ("source_path", "source_sha256", "stats"):
         value = results.get(key)
         if value:
             export[key] = value
@@ -97,6 +99,87 @@ def _save_findings(path: str, results: Dict[str, Any]) -> None:
         if temp_path.exists():
             temp_path.unlink()
     print(f"  发现 JSON: {path}")
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(
+        f".{path.name}.tmp-{os.getpid()}-{time.time_ns()}"
+    )
+    try:
+        with temp_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def _checkpoint_run_dir(
+        checkpoint_root: str | Path,
+        identity: Dict[str, Any]) -> tuple[Path, str]:
+    encoded = json.dumps(
+        identity, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    run_key = hashlib.sha256(encoded).hexdigest()[:20]
+    return Path(checkpoint_root) / run_key, run_key
+
+
+def _checkpoint_record_path(run_dir: Path, index: int) -> Path:
+    return run_dir / f"chunk-{index:06d}.json"
+
+
+def _load_chunk_checkpoint(
+        path: Path, identity: Dict[str, Any], index: int,
+        chunk_sha256: str) -> Optional[List[Dict]]:
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("schema") != MAX_CHECKPOINT_SCHEMA:
+        return None
+    if payload.get("identity") != identity:
+        return None
+    if payload.get("index") != index:
+        return None
+    if payload.get("chunk_sha256") != chunk_sha256:
+        return None
+    if payload.get("status") != "complete":
+        return None
+    findings = payload.get("findings")
+    return findings if isinstance(findings, list) else None
+
+
+def _write_chunk_checkpoint(
+        run_dir: Path, identity: Dict[str, Any], index: int,
+        chunk_sha256: str, status: str,
+        findings: Optional[List[Dict]] = None,
+        error: str = "") -> None:
+    payload: Dict[str, Any] = {
+        "schema": MAX_CHECKPOINT_SCHEMA,
+        "identity": identity,
+        "index": index,
+        "chunk_sha256": chunk_sha256,
+        "status": status,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    if status == "complete":
+        payload["findings"] = findings if findings is not None else []
+    elif error:
+        payload["error"] = error
+    _atomic_write_json(_checkpoint_record_path(run_dir, index), payload)
 
 
 # ── P 编号文本池（与 writeback_engine.build_para_map 逐字节一致）──────
@@ -182,7 +265,9 @@ def _find_source_docx(file_arg: str) -> Optional[str]:
     return None
 
 
-def _resolve_findings_to_p(findings: List[Dict], text_map: Dict[int, str]) -> List[Dict]:
+def _resolve_findings_to_p(
+        findings: List[Dict], text_map: Dict[int, str],
+        skip_log: Optional[List[Dict]] = None) -> List[Dict]:
     """把 finding 定位到具体 P 段落，补充 pn/current/location。
 
     策略：
@@ -190,8 +275,20 @@ def _resolve_findings_to_p(findings: List[Dict], text_map: Dict[int, str]) -> Li
       2. 无显式 P 时，精确命中必须全书唯一。
       3. 模糊命中必须有唯一且明显领先的最高分。
       4. 重复、并列或未命中的 finding 跳过写回，仍保留在报告中。
+
+    skip_log 非 None 时，被跳过的 finding 会带原因（duplicate_anchor /
+    fuzzy_tie / p_out_of_range / explicit_p_not_found / not_found /
+    empty_key_text）追加进去，供 *_skipped.json 落盘与统计。
     """
     from .special_checker.match_similar_text import find_best_match
+
+    def log_skip(reason: str, detail: str, f: Dict) -> None:
+        if skip_log is not None:
+            skip_log.append({
+                "reason": reason,
+                "detail": detail,
+                "finding": dict(f),
+            })
 
     items = sorted(text_map.items())  # [(pn, text)]
     if not items:
@@ -206,6 +303,7 @@ def _resolve_findings_to_p(findings: List[Dict], text_map: Dict[int, str]) -> Li
         key_text = re.sub(r"^#{1,6}\s*", "", key_text).strip()
         key_text = re.sub(r"^\s*[-*]\s+", "", key_text).strip()
         if not key_text:
+            log_skip("empty_key_text", "finding 缺少可用于定位的文本字段", f)
             continue
 
         best = None
@@ -229,9 +327,12 @@ def _resolve_findings_to_p(findings: List[Dict], text_map: Dict[int, str]) -> Li
                             "ratio": bm["ratio"], "match_method": "fuzzy"}
             if best is None:
                 print(f"  WARN: 显式 P{requested_pn} 未找到锚点，跳过写回: {key_text[:30]}")
+                log_skip("explicit_p_not_found",
+                         f"显式 P{requested_pn} 段内未找到锚点", f)
                 continue
         elif requested_pn is not None:
             print(f"  WARN: P{requested_pn} 超出文档范围，跳过写回: {key_text[:30]}")
+            log_skip("p_out_of_range", f"显式 P{requested_pn} 超出文档范围", f)
             continue
         else:
             exact_candidates = [
@@ -243,6 +344,7 @@ def _resolve_findings_to_p(findings: List[Dict], text_map: Dict[int, str]) -> Li
             elif len(exact_candidates) > 1:
                 pages = ", ".join(f"P{item['pn']}" for item in exact_candidates[:8])
                 print(f"  WARN: 锚点跨段重复（{pages}），跳过写回: {key_text[:30]}")
+                log_skip("duplicate_anchor", f"锚点跨段重复（{pages}）", f)
                 continue
 
         # 无精确命中时做模糊定位，并要求最高分唯一领先。
@@ -262,6 +364,9 @@ def _resolve_findings_to_p(findings: List[Dict], text_map: Dict[int, str]) -> Li
                 runner_up = fuzzy_candidates[1] if len(fuzzy_candidates) > 1 else None
                 if runner_up and top["ratio"] - runner_up["ratio"] < 5:
                     print(f"  WARN: 模糊锚点并列，跳过写回: {key_text[:30]}")
+                    log_skip("fuzzy_tie",
+                             f"模糊锚点并列（{top['ratio']:.1f} vs "
+                             f"{runner_up['ratio']:.1f}，分差<5）", f)
                     continue
                 best = top
 
@@ -274,6 +379,7 @@ def _resolve_findings_to_p(findings: List[Dict], text_map: Dict[int, str]) -> Li
             resolved.append(f)
         else:
             print(f"  WARN: finding 未定位，跳过写回: {key_text[:30]}")
+            log_skip("not_found", "精确/模糊均未能唯一定位", f)
     return resolved
 
 
@@ -475,9 +581,11 @@ def phase0_structure(text: str, rules_path: Optional[str] = None) -> List[Dict]:
 
 
 async def _proofread_one_json(
-        chunk: Dict, index: int, total: int, model: str, rate_limiter) -> Optional[Dict]:
+        chunk: Dict, index: int, total: int, model: str, rate_limiter,
+        system_prompt: str,
+        api_stats: Dict[str, int | float]) -> Optional[Dict]:
     """处理单个 chunk，返回 {index, findings, chunk_text}。"""
-    from .proofreader import deepseek, load_system_prompt
+    from .proofreader import deepseek_async
 
     target_text = chunk.get("target", "")
     context_text = chunk.get("context", "")
@@ -490,42 +598,126 @@ async def _proofread_one_json(
         pre_text += f"\n<context>\n{context_text}\n</context>"
     post_text = f"<target>\n{target_text}\n</target>"
 
-    await rate_limiter.wait()
-    sys_prompt = load_system_prompt("json")
     # JSON 发现模式：限制输出上限，避免模型生成超长 JSON 拖慢审校（见 CLAUDE.md）
-    result = await asyncio.get_event_loop().run_in_executor(
-        None, lambda: deepseek(
-            post_text, pre_text, model,
-            system_prompt=sys_prompt, max_tokens=4096))
+    result = await deepseek_async(
+        post_text, pre_text, model, rate_limiter,
+        system_prompt=system_prompt, max_tokens=4096,
+        stats=api_stats, request_label=f"chunk {index}/{total}",
+    )
 
     if not result:
-        print(f"  ⚠️  chunk {index}/{total}: 返回空", file=sys.stderr)
+        print(f"  ⚠️  chunk {index}/{total}: API 失败", file=sys.stderr)
         return None
 
     findings = _json_extract(result)
-    print(f"  ✓ chunk {index}/{total}: 发现 {len(findings) if findings else 0} 条")
+    if findings is None:
+        api_stats["invalid_json"] += 1
+        print(f"  ⚠️  chunk {index}/{total}: JSON 无效", file=sys.stderr)
+        return None
+    print(f"  ✓ chunk {index}/{total}: 发现 {len(findings)} 条")
     # index 用 0-based（供 refined_chunks 回写），显示时已加 1
     return {"index": index - 1, "findings": findings, "chunk_text": target_text}
 
 
 async def phase1_json_proofread(
         chunks: List[Dict], model: str = "deepseek-v4-flash",
-        concurrent: int = 3, rpm: int = 15) -> Dict:
+        concurrent: int = 3, rpm: int = 15,
+        checkpoint_root: str | Path | None = None,
+        checkpoint_identity: Optional[Dict[str, Any]] = None,
+        system_prompt: Optional[str] = None) -> Dict:
     """异步并发 JSON 发现模式审校。返回 {findings, refined_chunks}。"""
-    from .proofreader import RateLimiter
+    from .proofreader import RateLimiter, load_system_prompt
 
+    started = time.perf_counter()
+    system_prompt = system_prompt or load_system_prompt("json")
     rate_limiter = RateLimiter(rpm)
     semaphore = asyncio.Semaphore(concurrent)
+    api_stats: Dict[str, int | float] = {
+        "logical_calls": 0,
+        "attempts": 0,
+        "retries": 0,
+        "failures": 0,
+        "empty_responses": 0,
+        "invalid_json": 0,
+        "rate_wait_seconds": 0.0,
+        "request_seconds": 0.0,
+    }
+    chunk_hashes = [
+        _sha256_text(json.dumps(
+            chunk, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        ))
+        for chunk in chunks
+    ]
+    run_dir: Optional[Path] = None
+    if checkpoint_root is not None:
+        if not checkpoint_identity:
+            raise ValueError("启用 max checkpoint 时必须提供 checkpoint_identity")
+        run_dir, run_key = _checkpoint_run_dir(
+            checkpoint_root, checkpoint_identity)
+        _atomic_write_json(run_dir / "manifest.json", {
+            "schema": MAX_CHECKPOINT_SCHEMA,
+            "run_key": run_key,
+            "identity": checkpoint_identity,
+            "chunk_count": len(chunks),
+            "chunk_sha256": chunk_hashes,
+        })
+
+    results: List[Optional[Dict]] = [None] * len(chunks)
+    checkpoint_hits = 0
+    pending: list[tuple[int, Dict]] = []
+    for idx, chunk in enumerate(chunks):
+        cached: Optional[List[Dict]] = None
+        if run_dir is not None and checkpoint_identity is not None:
+            cached = _load_chunk_checkpoint(
+                _checkpoint_record_path(run_dir, idx),
+                checkpoint_identity, idx, chunk_hashes[idx],
+            )
+        if cached is not None:
+            checkpoint_hits += 1
+            results[idx] = {
+                "index": idx,
+                "findings": cached,
+                "chunk_text": chunk.get("target", ""),
+            }
+        else:
+            pending.append((idx, chunk))
 
     async def worker(idx: int, chunk: Dict) -> Optional[Dict]:
         async with semaphore:
-            return await _proofread_one_json(chunk, idx + 1, len(chunks), model, rate_limiter)
+            result = await _proofread_one_json(
+                chunk, idx + 1, len(chunks), model, rate_limiter,
+                system_prompt, api_stats,
+            )
+            if run_dir is not None and checkpoint_identity is not None:
+                if result is None:
+                    _write_chunk_checkpoint(
+                        run_dir, checkpoint_identity, idx,
+                        chunk_hashes[idx], "failed",
+                        error="API 返回空、异常耗尽或 JSON 无效",
+                    )
+                else:
+                    _write_chunk_checkpoint(
+                        run_dir, checkpoint_identity, idx,
+                        chunk_hashes[idx], "complete",
+                        findings=result["findings"],
+                    )
+            return result
 
-    tasks = [worker(i, c) for i, c in enumerate(chunks)]
-    results = await asyncio.gather(*tasks)
+    if pending:
+        completed = await asyncio.gather(
+            *(worker(idx, chunk) for idx, chunk in pending)
+        )
+        for (idx, _), result in zip(pending, completed):
+            results[idx] = result
 
     all_findings: List[Dict] = []
     refined_chunks = [c.get("target", "") for c in chunks]
+    # Layer A 丢弃可见性：LLM 返回的原始发现里，有多少因「无实际修改 /
+    # 匹配不到原文 / 匹配率过低」被静默丢弃 —— 全部带原因记入 skipped，
+    # 由调用方落盘 *_skipped.json 供人工复核。
+    skipped: List[Dict] = []
+    findings_from_llm = 0
     for r in results:
         if r is None:
             continue
@@ -533,29 +725,83 @@ async def phase1_json_proofread(
         chunk_text = r["chunk_text"]
         new_text = chunk_text
         for item in (r["findings"] or []):
+            findings_from_llm += 1
             original = (item or {}).get("original_sentence") or ""
             corrected = (item or {}).get("corrected_sentence") or ""
             if not original or not corrected or original == corrected:
+                skipped.append({
+                    "reason": "no_op_change",
+                    "detail": "原句为空、改句为空或原句等于改句",
+                    "original": original,
+                    "corrected": corrected,
+                })
                 continue
             from .special_checker.match_similar_text import find_best_match
             bm = find_best_match(chunk_text, original, modified=corrected)
-            if bm["location"] and bm["ratio"] >= 60:
-                start, end = bm["location"]
-                new_text = new_text[:start] + corrected + new_text[end:]
-                all_findings.append({
-                    "phase": "1_llm",
-                    "type": "correction",
+            if not bm["location"]:
+                skipped.append({
+                    "reason": "match_no_location",
+                    "detail": "模糊匹配未能定位到原文",
                     "original": original,
-                    "suggestion": corrected,
-                    "real_text": bm["real_text"],  # 实际匹配到的原文（供 P 映射）
-                    "location": [start, end],
-                    "ratio": bm["ratio"],
-                    "severity": "warn",
-                    "confidence": 0.7,
+                    "corrected": corrected,
                 })
+                continue
+            if bm["ratio"] < 60:
+                skipped.append({
+                    "reason": "match_below_threshold",
+                    "detail": f"匹配率 {bm['ratio']:.1f} < 60，疑似 LLM 改写而非原文",
+                    "original": original,
+                    "corrected": corrected,
+                    "ratio": round(bm["ratio"], 2),
+                })
+                continue
+            start, end = bm["location"]
+            new_text = new_text[:start] + corrected + new_text[end:]
+            all_findings.append({
+                "phase": "1_llm",
+                "type": "correction",
+                "original": original,
+                "suggestion": corrected,
+                "real_text": bm["real_text"],  # 实际匹配到的原文（供 P 映射）
+                "location": [start, end],
+                "ratio": bm["ratio"],
+                "severity": "warn",
+                "confidence": 0.7,
+            })
         refined_chunks[r["index"]] = new_text
 
-    return {"findings": all_findings, "refined_chunks": refined_chunks}
+    failed_chunks = sum(1 for result in results if result is None)
+    stats: Dict[str, Any] = {
+        "total_chunks": len(chunks),
+        "checkpoint_hits": checkpoint_hits,
+        "attempted_chunks": len(pending),
+        "completed_chunks": len(chunks) - failed_chunks,
+        "failed_chunks": failed_chunks,
+        "findings_from_llm": findings_from_llm,
+        "dropped_match": len(skipped),
+        **api_stats,
+        "elapsed_seconds": round(time.perf_counter() - started, 3),
+    }
+    if run_dir is not None:
+        stats["checkpoint_dir"] = str(run_dir.resolve())
+    print(
+        "  阶段统计: "
+        f"块={stats['total_chunks']} "
+        f"续跑命中={stats['checkpoint_hits']} "
+        f"本次调用={stats['attempted_chunks']} "
+        f"失败={stats['failed_chunks']} | "
+        f"API尝试={stats['attempts']} 重试={stats['retries']} "
+        f"空响应={stats['empty_responses']} JSON无效={stats['invalid_json']} | "
+        f"限速等待={stats['rate_wait_seconds']:.2f}s "
+        f"请求累计={stats['request_seconds']:.2f}s "
+        f"墙钟={stats['elapsed_seconds']:.2f}s"
+    )
+    return {
+        "findings": all_findings,
+        "refined_chunks": refined_chunks,
+        "stats": stats,
+        "skipped": skipped,
+    }
 
 
 # ── Phase 2: 专名查词（可选） ─────────────────────────────────────────
@@ -649,7 +895,8 @@ def phase4_report(
         tgscc: List[Dict], variants: List[Dict], structure: List[Dict],
         llm: List[Dict], align: Dict,
         source_text: str = "", names: Optional[List[Dict]] = None,
-        model: str = "", extra: Optional[str] = "") -> str:
+        model: str = "", extra: Optional[str] = "",
+        skipped: Optional[List[Dict]] = None) -> str:
     """生成自包含 master HTML 报告 — V3 深色主题 · 原文内嵌高亮。
 
     委托给 html_report_v3.phase4_report_v3()。
@@ -659,7 +906,8 @@ def phase4_report(
     return phase4_report_v3(
         out_dir=out_dir, docname=docname, source_text=source_text,
         tgscc=tgscc, variants=variants, structure=structure,
-        llm=llm, names=names, align=align, model=model, extra=extra or "")
+        llm=llm, names=names, align=align, model=model,
+        extra=extra or "", skipped=skipped)
 
 
 # ── 主流程 ────────────────────────────────────────────────────────────
@@ -669,15 +917,20 @@ def run_max(
         file_path: str, model: str = "deepseek-v4-flash",
         concurrent: int = 3, rpm: int = 15,
         run_names: bool = False, verbose: bool = False,
-        writeback: bool = False, author: str = "审校助手") -> Dict:
+        writeback: bool = False, author: str = "审校助手",
+        chunk_size: int = 200) -> Dict:
     """执行完整 max 管线。返回各阶段结果与产物路径。
 
     writeback=True 时，审校完成后直接把发现回写到 DOCX（02 引擎，字符级修订+批注）。
     """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size 必须是正整数")
     from .cli import _resolve_input  # 复用 DOCX→MD 转换
     from .extract_source import sha256_file
+    from .proofreader import load_system_prompt
     from .splitter import split_markdown_by_title_and_length_with_context
 
+    run_started = time.perf_counter()
     fpath = Path(file_path)
     src_docx = _find_source_docx(file_path)
     src_docx_sha256 = sha256_file(src_docx) if src_docx else None
@@ -694,9 +947,20 @@ def run_max(
     out_dir = str(md_path.parent)
     docname = md_path.stem
     results: Dict[str, Any] = {}
+    stage_stats: Dict[str, Any] = {}
     if src_docx and src_docx_sha256:
         results["source_path"] = str(Path(src_docx).resolve())
         results["source_sha256"] = src_docx_sha256
+    review_source_sha256 = src_docx_sha256 or sha256_file(md_path)
+    system_prompt = load_system_prompt("json")
+    prompt_sha256 = _sha256_text(system_prompt)
+    checkpoint_identity = {
+        "source_sha256": review_source_sha256,
+        "model": model,
+        "prompt_sha256": prompt_sha256,
+        "chunk_size": chunk_size,
+    }
+    checkpoint_root = Path(out_dir) / f".{docname}_max_checkpoint"
 
     print("╔════════════════════════════════════════════╗")
     print("║  ai-proofread · 最大化检查模式             ║")
@@ -705,6 +969,7 @@ def run_max(
 
     # ── Phase 0: 确定性检查 ──
     print("\n[Phase 0] 确定性检查...")
+    phase0_started = time.perf_counter()
     print("  0a. TGSCC 汉字规范...")
     t0 = time.time()
     tgscc = phase0_tgscc(text)
@@ -722,22 +987,49 @@ def run_max(
     structure = phase0_structure(text)
     print(f"      ✓ {len(structure)} 条 ({(time.time()-t0)*1000:.0f}ms)")
     results["structure"] = structure
+    stage_stats["phase0"] = {
+        "seconds": round(time.perf_counter() - phase0_started, 3),
+        "findings": len(tgscc) + len(variants) + len(structure),
+    }
 
     # ── Phase 1: LLM JSON 发现模式 ──
     print(f"\n[Phase 1] LLM 审校（JSON 发现模式，模型={model}）...")
     print("  分块...")
     chunks = split_markdown_by_title_and_length_with_context(
-        text, levels=[1, 2], cut_by=200)
+        text, levels=[1, 2], cut_by=chunk_size)
     print(f"      ✓ {len(chunks)} 块")
 
     print("  异步并发审校...")
     t0 = time.time()
     llm_result = asyncio.run(phase1_json_proofread(
-        chunks, model=model, concurrent=concurrent, rpm=rpm))
+        chunks, model=model, concurrent=concurrent, rpm=rpm,
+        checkpoint_root=checkpoint_root,
+        checkpoint_identity=checkpoint_identity,
+        system_prompt=system_prompt))
     llm = llm_result["findings"]
     refined_text = "\n".join(llm_result["refined_chunks"])
-    print(f"      ✓ {len(llm)} 条修正 ({(time.time()-t0):.0f}s)")
+    # Layer A 丢弃（chunk 内定位失败）在 phase1 内收集；Layer B 丢弃（P 段
+    # 解析失败）在 Phase 5 回写前由 _resolve_findings_to_p 追加，统一落盘。
+    llm_skipped = llm_result.get("skipped", []) or []
+    skipped_all: List[Dict] = list(llm_skipped)
+    print(f"      ✓ {len(llm)} 条修正 ({(time.time()-t0):.0f}s)"
+          f"{f'；{len(llm_skipped)} 条被跳过/未定位' if llm_skipped else ''}")
     results["llm"] = llm
+    phase1_stats = llm_result.get("stats", {
+        "total_chunks": len(chunks),
+        "checkpoint_hits": 0,
+        "attempted_chunks": len(chunks),
+        "completed_chunks": len(chunks),
+        "failed_chunks": 0,
+        "elapsed_seconds": round(time.time() - t0, 3),
+    })
+    stage_stats["phase1"] = phase1_stats
+    results["stats"] = stage_stats
+    if phase1_stats.get("failed_chunks", 0):
+        raise RuntimeError(
+            "Phase 1 存在失败分块，已保留 checkpoint；"
+            "重新运行同一命令将只补失败块"
+        )
 
     # 精修版落盘
     refined_path = os.path.join(out_dir, f"{docname}_refined.md")
@@ -752,53 +1044,103 @@ def run_max(
 
     # ── Phase 2: 专名查词（可选） ──
     names = []
+    phase2_started = time.perf_counter()
     if run_names:
         print("\n[Phase 2] 专名查词...")
         names = phase2_names(refined_text, model=model)
     results["names"] = names
-    _save_findings(findings_path, results)
+    stage_stats["phase2"] = {
+        "seconds": round(time.perf_counter() - phase2_started, 3),
+        "enabled": run_names,
+        "findings": len(names),
+    }
 
     # ── Phase 3: 句子对齐 ──
     print("\n[Phase 3] 句子对齐...")
     t0 = time.time()
     align_base = os.path.join(out_dir, docname)
     align = phase3_align(text, refined_text, align_base)
+    phase3_seconds = time.time() - t0
     print(f"      ✓ 匹配={align['stats'].get('match')} "
           f"删除={align['stats'].get('delete')} 新增={align['stats'].get('insert')} "
-          f"({(time.time()-t0):.0f}s)")
+          f"({phase3_seconds:.0f}s)")
     results["align"] = align
+    stage_stats["phase3"] = {"seconds": round(phase3_seconds, 3)}
 
     # ── Phase 4: master 报告 ──
     print("\n[Phase 4] 综合报告...")
+    phase4_started = time.perf_counter()
     extra = f"· 模型 {model} · 并发 {concurrent}"
     report_path = phase4_report(
         out_dir, docname, tgscc, variants, structure,
         llm, align, source_text=text, names=names,
-        model=model, extra=extra)
+        model=model, extra=extra, skipped=skipped_all)
     results["report_path"] = report_path
     print(f"  ✓ 报告: {report_path}")
+    stage_stats["phase4"] = {
+        "seconds": round(time.perf_counter() - phase4_started, 3),
+    }
+    results["stats"] = stage_stats
+    if writeback and src_docx:
+        # Preserve findings even when the source changes before Word writeback.
+        _save_findings(findings_path, results)
 
     # ── Phase 5: DOCX 回写（02 引擎，直接 OOXML） ──
     if writeback and src_docx:
         print("\n[Phase 5] DOCX 回写（02 引擎，直接 OOXML）...")
+        phase5_started = time.perf_counter()
         current_sha256 = sha256_file(src_docx)
         if current_sha256 != src_docx_sha256:
             raise RuntimeError("源 DOCX 在审校期间发生变化，拒绝写回")
         all_findings = llm + tgscc + variants + structure + names
-        resolved = _resolve_findings_to_p(all_findings, text_map)
+        resolved = _resolve_findings_to_p(all_findings, text_map,
+                                          skip_log=skipped_all)
         issues = _findings_to_issues(resolved)
         n_must = sum(1 for i in issues if i["fix_class"] == "must_fix")
         n_polish = sum(1 for i in issues if i["fix_class"] == "polish")
         n_verify = sum(1 for i in issues if i["fix_class"] == "verify")
+        layer_b_drops = len(skipped_all) - len(llm_skipped)
         print(f"  ✓ 定位 {len(resolved)} 条发现 → {len(issues)} 条 issues"
-              f"（必改 {n_must} + 润色 {n_polish} + 待核 {n_verify}）")
+              f"（必改 {n_must} + 润色 {n_polish} + 待核 {n_verify}"
+              f"{f'；{layer_b_drops} 条未定位跳过' if layer_b_drops else ''}）")
 
         review_path = _run_02_writeback(
             src_docx, docname, issues, author,
             expected_source_sha256=src_docx_sha256)
         results["review_path"] = review_path
         print(f"  ✓ 审阅版: {review_path}")
+        stage_stats["phase5"] = {
+            "seconds": round(time.perf_counter() - phase5_started, 3),
+            "issues": len(issues),
+            "dropped_resolution": len(skipped_all) - len(llm_skipped),
+        }
 
+    # Layer A + B 丢弃可见性：带原因原子落盘 *_skipped.json，供人工复核
+    # 覆盖率损失（LLM 改写太离谱 / 锚点跨段重复 / 模糊并列 / 完全未定位等）。
+    skipped_path = ""
+    if skipped_all:
+        skipped_path = os.path.join(out_dir, f"{docname}_skipped.json")
+        _atomic_write_json(Path(skipped_path), {
+            "schema": "ai-proofread.skipped.v1",
+            "source_sha256": review_source_sha256,
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "count": len(skipped_all),
+            "dropped": skipped_all,
+        })
+        results["skipped_path"] = skipped_path
+        print(f"  ⚠️  {len(skipped_all)} 条发现被跳过/未定位，"
+              f"未进入修订与批注（详见 {skipped_path}）")
+
+    stage_stats["total_seconds"] = round(
+        time.perf_counter() - run_started, 3)
+    results["stats"] = stage_stats
+    _save_findings(findings_path, results)
+    print("\n阶段耗时:")
+    for phase in ("phase0", "phase1", "phase2", "phase3", "phase4", "phase5"):
+        data = stage_stats.get(phase)
+        if isinstance(data, dict):
+            print(f"  {phase}: {data.get('seconds', data.get('elapsed_seconds', 0)):.2f}s")
+    print(f"  total: {stage_stats['total_seconds']:.2f}s")
     print("\n✅ 最大化检查完成")
     return results
 
@@ -889,6 +1231,7 @@ if __name__ == "__main__":
     ap.add_argument("--model", default="deepseek-v4-flash")
     ap.add_argument("--concurrent", type=int, default=3)
     ap.add_argument("--rpm", type=int, default=15)
+    ap.add_argument("--chunk-size", type=int, default=200)
     ap.add_argument("--names", action="store_true", help="启用专名查词")
     ap.add_argument("--writeback", action="store_true", help="审校后回写 DOCX")
     ap.add_argument("--author", default="审校助手")
@@ -896,4 +1239,5 @@ if __name__ == "__main__":
     args = ap.parse_args()
     run_max(args.file, model=args.model, concurrent=args.concurrent,
             rpm=args.rpm, run_names=args.names, verbose=args.verbose,
-            writeback=args.writeback, author=args.author)
+            writeback=args.writeback, author=args.author,
+            chunk_size=args.chunk_size)

@@ -36,7 +36,7 @@ proofread d  <original.md> <proofed.md>  # HTML word-level diff
 proofread s  <file.md>                   # TGSCC Chinese character spec check
 ```
 
-Key flags: `--model` (default `deepseek-v4-flash`), `--concurrent N` (LLM concurrency, default 3), `--rpm N` (API rate limit), `--names` (max mode proper-noun dictionary lookup), `--writeback` (max mode auto-writeback to DOCX).
+Key flags: `--model` (default `deepseek-v4-flash`), `--concurrent N` (LLM concurrency, default 3), `--rpm N` (API rate limit), `--chunk-size N` (max target size, default 200), `--names` (max mode proper-noun dictionary lookup), `--writeback` (max mode auto-writeback to DOCX).
 
 ## Codex project entry (Word + PDF)
 
@@ -140,7 +140,15 @@ python3 -m unittest \
   tests.test_extract_source \
   tests.test_codex_entry \
   tests.test_pdf_pipeline \
-  tests.test_word_writeback
+  tests.test_word_writeback \
+  tests.test_altchunk \
+  tests.test_splitter_context \
+  tests.test_network_resume \
+  tests.test_skip_visibility \
+  tests.test_book_path
+
+# 确定性阶段回归（无需 API，秒级）：samples/审校合成稿.md 固定样本
+python3 samples/validate_synthetic.py
 
 # Legacy/manual suites
 python tests/test_sentence_split.py
@@ -259,16 +267,22 @@ Google models (gemini-*)
 16万字 book it took 11321s (≈3h) at the old defaults. Pure-Word and altChunk
 runs have identical API cost; misreports do not affect duration.
 
-**Recommended for book-length files:**
+**Safe default until the chunk-size quality gate passes:**
 
 ```zsh
-proofread m 书稿.md --no-view --concurrent 8 --rpm 60
+proofread m 书稿.md --no-view --concurrent 3 --rpm 15 --chunk-size 200
 ```
 
-- `--concurrent 8`: 8 parallel API calls (default 3 serializes the loop).
-- `--rpm 60`: per-minute cap (default 15 throttles hard — measured 3× slowdown).
-- Rough estimate: 16万字 / 500 chunks ≈ **1h** at 8/60, vs 3h at 3/15.
-- `--concurrent 12 --rpm 90` ≈ 40min, but watch for API 429 — retries hard-wait.
+- Do not raise concurrency or RPM merely to reduce wall time. First run the fixed
+  120-paragraph quality sample at 600/800/1200 characters and keep 200 until recall
+  and precision pass the gate.
+- Each max chunk is atomically checkpointed under `.<doc>_max_checkpoint/`; the
+  identity includes source hash, model, prompt hash, chunk-size and chunk hash.
+- API retries are explicit and observable: SDK retries are disabled, timeout is
+  300 seconds, and each logical request has at most two retries. Empty or invalid
+  JSON responses are failures, not successful empty reviews.
+- The max report includes phase wall time, logical calls, attempts, retries, rate-limit
+  waits and checkpoint hits. A second run should produce zero API calls for completed chunks.
 
 Concurrency **never affects output quality** — each chunk is an independent,
 identically-prompted call. Only API quota / 429s are the practical ceiling.

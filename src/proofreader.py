@@ -7,6 +7,9 @@ import os
 import json
 import time
 import asyncio
+import atexit
+import threading
+from functools import partial
 from typing import List, Callable
 from concurrent.futures import ThreadPoolExecutor
 
@@ -25,6 +28,14 @@ PROMPT_FILE_PATH_JSON = os.path.join(_PROMPT_DIR, "prompt-proofreader-system-out
 SYSTEM_PROMPT = ""
 with open(PROMPT_FILE_PATH, "r", encoding="utf-8") as file:
     SYSTEM_PROMPT = file.read()
+
+API_TIMEOUT_SECONDS = 300.0
+API_MAX_ATTEMPTS = 3  # Initial request plus two explicit retries.
+API_RETRY_DELAYS = (5.0, 8.0)
+
+_OPENAI_CLIENTS: dict[str, OpenAI] = {}
+_OPENAI_CLIENTS_LOCK = threading.Lock()
+_API_EXECUTOR = ThreadPoolExecutor(thread_name_prefix="ai-proofread-api")
 
 
 def load_system_prompt(mode: str = "rewrite") -> str:
@@ -57,7 +68,103 @@ class RateLimiter:
             self.last_call_time = time.time()
 
 
-def deepseek(content: str, reference: str="", model:str="deepseek-v4-flash", system_prompt: str|None = None, max_tokens: int|None = None) -> str|None:
+def _client_config(model: str) -> tuple[str, str | None, str]:
+    direct_models = {
+        "deepseek-v4-flash", "deepseek-v4-pro",
+        "deepseek-chat", "deepseek-reasoner",
+    }
+    if model in direct_models:
+        return "deepseek", os.getenv("DEEPSEEK_API_KEY"), "https://api.deepseek.com"
+    if model == "deepseek-v3":
+        return (
+            "aliyun",
+            os.getenv("ALIYPUN_API_KEY"),
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+    raise ValueError(f"模型名称错误：{model}")
+
+
+def _get_openai_client(model: str) -> OpenAI:
+    """Return one pooled SDK client per provider for the process lifetime."""
+    provider, api_key, base_url = _client_config(model)
+    with _OPENAI_CLIENTS_LOCK:
+        client = _OPENAI_CLIENTS.get(provider)
+        if client is None:
+            client = OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                max_retries=0,
+                timeout=API_TIMEOUT_SECONDS,
+            )
+            _OPENAI_CLIENTS[provider] = client
+    return client
+
+
+def _close_openai_clients() -> None:
+    with _OPENAI_CLIENTS_LOCK:
+        clients = list(_OPENAI_CLIENTS.values())
+        _OPENAI_CLIENTS.clear()
+    for client in clients:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+atexit.register(_close_openai_clients)
+
+
+def _build_messages(content: str, reference: str,
+                    system_prompt: str | None) -> list[dict[str, str]]:
+    effective_system = system_prompt if system_prompt is not None else SYSTEM_PROMPT
+    messages = [{"role": "system", "content": effective_system}]
+    if reference:
+        messages.extend([
+            {"role": "assistant", "content": ""},
+            {"role": "user", "content": reference},
+        ])
+    messages.extend([
+        {"role": "assistant", "content": ""},
+        {"role": "user", "content": content},
+    ])
+    return messages
+
+
+def _deepseek_request_once(model: str, messages: list[dict[str, str]],
+                           max_tokens: int | None = None) -> str | None:
+    client = _get_openai_client(model)
+    kwargs = {
+        "model": model,
+        "messages": messages,
+        "temperature": 1.3,
+        "stream": False,
+    }
+    if max_tokens:
+        kwargs["max_tokens"] = max_tokens
+    response = client.chat.completions.create(**kwargs)
+    return response.choices[0].message.content
+
+
+def _clean_model_result(result: str) -> str:
+    return result.replace("\n</target>", "").replace("<target>\n", "")
+
+
+def _new_api_stats() -> dict[str, int | float]:
+    return {
+        "logical_calls": 0,
+        "attempts": 0,
+        "retries": 0,
+        "failures": 0,
+        "empty_responses": 0,
+        "rate_wait_seconds": 0.0,
+        "request_seconds": 0.0,
+    }
+
+
+def deepseek(content: str, reference: str = "",
+             model: str = "deepseek-v4-flash",
+             system_prompt: str | None = None,
+             max_tokens: int | None = None) -> str | None:
     """
     调用各家deepseek校对模型，返回校对后的文本
 
@@ -72,82 +179,96 @@ def deepseek(content: str, reference: str="", model:str="deepseek-v4-flash", sys
     system_prompt: 覆盖默认系统提示词（如 JSON 发现模式）
     """
 
-    client: OpenAI|None = None
-    base_url = "https://api.deepseek.com"
-
-    DEEPSEEK_DIRECT = {"deepseek-v4-flash", "deepseek-v4-pro",
-                       "deepseek-chat", "deepseek-reasoner"}
-
-    if model in DEEPSEEK_DIRECT:
-        client = OpenAI(api_key=os.getenv("DEEPSEEK_API_KEY"), base_url=base_url)
-    elif model == "deepseek-v3":
-        # 初始化阿里云deepseek v3
-        client = OpenAI(
-            # 若没有配置环境变量，请用百炼API Key将下行替换为：api_key="sk-xxx",
-            # 如何获取API Key：https://help.aliyun.com/zh/model-studio/developer-reference/get-api-key
-            api_key=os.getenv("ALIYPUN_API_KEY"),
-            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
-        )
-    else:
-        print(f"模型名称错误：{model}")
+    try:
+        _client_config(model)
+    except ValueError as exc:
+        print(exc)
         return None
-
-    retry_count = 0
-    result = ""
-
-    effective_system = system_prompt if system_prompt is not None else SYSTEM_PROMPT
-    message= [{"role": "system", "content": effective_system}]
-    # 单独提交一轮reference可节省token但效果有待验证 TODO
-    if reference:
-        message.extend([{"role": "assistant", "content": ""},
-                        {"role": "user", "content": reference}])
-    message.extend([{"role": "assistant", "content": ""},# 回答示例，避免模型应答
-                    {"role": "user", "content": content},])
-    # print(message)
-
-    while retry_count < 3:
+    messages = _build_messages(content, reference, system_prompt)
+    for attempt in range(1, API_MAX_ATTEMPTS + 1):
+        started = time.perf_counter()
         try:
-            print(f"正在调用 {model} API (尝试 {retry_count+1}/3)...")
-            kwargs = dict(
-                model=model,
-                messages=message,  # type: ignore
-                temperature=1.3,
-                stream=False,
-            )
-            if max_tokens:
-                kwargs["max_tokens"] = max_tokens
-            response = client.chat.completions.create(**kwargs)
-            result = response.choices[0].message.content
-            if result:
-                break
+            print(f"API {model}: 尝试 {attempt}/{API_MAX_ATTEMPTS}")
+            result = _deepseek_request_once(model, messages, max_tokens)
         except Exception as e:
-            print(f"API调用出错: {str(e)}")
-            # 优化等待时间策略
-            wait_time = 5 + retry_count * 3
-            print(f"等待 {wait_time} 秒后重试...")
-            time.sleep(wait_time)
-            retry_count += 1
-            continue
+            elapsed = time.perf_counter() - started
+            print(f"API {model}: 尝试 {attempt} 异常 ({elapsed:.2f}s): {e}")
+        else:
+            elapsed = time.perf_counter() - started
+            if isinstance(result, str) and result:
+                print(f"API {model}: 尝试 {attempt} 成功 ({elapsed:.2f}s)")
+                return _clean_model_result(result)
+            print(f"API {model}: 尝试 {attempt} 返回空 ({elapsed:.2f}s)")
+        if attempt < API_MAX_ATTEMPTS:
+            delay = API_RETRY_DELAYS[attempt - 1]
+            print(f"API {model}: {delay:.0f}s 后重试")
+            time.sleep(delay)
+    print(f"API {model}: {API_MAX_ATTEMPTS} 次尝试均失败")
+    return None
 
-    result = result.replace("\n</target>", "").replace("<target>\n", "")
 
-    return result
-
-
-async def deepseek_async(content: str, reference: str, model:str, rate_limiter: RateLimiter) -> str|None:
+async def deepseek_async(
+        content: str, reference: str, model: str, rate_limiter: RateLimiter,
+        system_prompt: str | None = None, max_tokens: int | None = None,
+        stats: dict[str, int | float] | None = None,
+        request_label: str = "") -> str | None:
     """
     异步调用deepseek校对模型，返回校对后的文本
     """
-    await rate_limiter.wait()
+    if stats is None:
+        stats = _new_api_stats()
+    stats["logical_calls"] += 1
+    messages = _build_messages(content, reference, system_prompt)
+    loop = asyncio.get_running_loop()
+    label = f" {request_label}" if request_label else ""
 
-    # 使用线程池执行同步API调用
-    loop = asyncio.get_event_loop()
-    with ThreadPoolExecutor() as executor:
-        result = await loop.run_in_executor(
-            executor,
-            lambda: deepseek(content, reference, model)
+    for attempt in range(1, API_MAX_ATTEMPTS + 1):
+        wait_started = time.perf_counter()
+        await rate_limiter.wait()
+        rate_wait = time.perf_counter() - wait_started
+        stats["rate_wait_seconds"] += rate_wait
+        stats["attempts"] += 1
+        if attempt > 1:
+            stats["retries"] += 1
+        print(
+            f"API {model}{label}: 尝试 {attempt}/{API_MAX_ATTEMPTS} "
+            f"(限速等待 {rate_wait:.2f}s)"
         )
-    return result
+        started = time.perf_counter()
+        try:
+            result = await loop.run_in_executor(
+                _API_EXECUTOR,
+                partial(_deepseek_request_once, model, messages, max_tokens),
+            )
+        except Exception as exc:
+            elapsed = time.perf_counter() - started
+            stats["request_seconds"] += elapsed
+            print(
+                f"API {model}{label}: 尝试 {attempt} 异常 "
+                f"({elapsed:.2f}s): {exc}"
+            )
+        else:
+            elapsed = time.perf_counter() - started
+            stats["request_seconds"] += elapsed
+            if isinstance(result, str) and result:
+                print(
+                    f"API {model}{label}: 尝试 {attempt} 成功 "
+                    f"({elapsed:.2f}s)"
+                )
+                return _clean_model_result(result)
+            stats["empty_responses"] += 1
+            print(
+                f"API {model}{label}: 尝试 {attempt} 返回空 "
+                f"({elapsed:.2f}s)"
+            )
+        if attempt < API_MAX_ATTEMPTS:
+            delay = API_RETRY_DELAYS[attempt - 1]
+            print(f"API {model}{label}: {delay:.0f}s 后重试")
+            await asyncio.sleep(delay)
+
+    stats["failures"] += 1
+    print(f"API {model}{label}: {API_MAX_ATTEMPTS} 次尝试均失败")
+    return None
 
 # 配置Google API（懒加载——仅在使用 Google 模型时初始化）
 _client = None
@@ -189,19 +310,95 @@ async def chat_google_async(text: str, rate_limiter: RateLimiter) -> str|None:
     """
     await rate_limiter.wait()
 
-    # 使用线程池执行同步API调用
-    loop = asyncio.get_event_loop()
-    with ThreadPoolExecutor() as executor:
-        result = await loop.run_in_executor(
-            executor,
-            lambda: chat_google(text)
-        )
+    # 复用进程级线程池，避免每个段落重复创建/销毁 executor。
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(_API_EXECUTOR, chat_google, text)
     return result
+
+
+def _book_sidecar_dir(json_out: str) -> str:
+    """book 路径每段独立的 checkpoint 目录（避免整份 JSON 读改写）。"""
+    return f"{json_out}.chunks"
+
+
+def _book_sidecar_path(json_out: str, index: int) -> str:
+    return os.path.join(_book_sidecar_dir(json_out), f"{index:06d}.json")
+
+
+def _book_error_path(json_out: str, index: int) -> str:
+    return os.path.join(_book_sidecar_dir(json_out), f"{index:06d}.error.json")
+
+
+def _atomic_write_book_chunk(json_out: str, index: int, result: str) -> None:
+    """单段结果原子写入侧车文件：O(1)，无需全局锁，中断后可逐段续跑。"""
+    path = _book_sidecar_path(json_out, index)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp_path = f"{path}.tmp-{os.getpid()}-{time.time_ns()}"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "schema": "ai-proofread.book-chunk.v1",
+            "index": index,
+            "result": result,
+        }, f, ensure_ascii=False, indent=2)
+        f.flush()
+    os.replace(temp_path, path)
+
+
+def _atomic_write_book_error(json_out: str, index: int,
+                             target_text: str, message: str) -> None:
+    """失败段的 error 标记，供下次续跑与人工排查。"""
+    path = _book_error_path(json_out, index)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp_path = f"{path}.tmp-{os.getpid()}-{time.time_ns()}"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "schema": "ai-proofread.book-chunk.v1",
+            "index": index,
+            "status": "failed",
+            "target_preview": target_text[:60],
+            "error": message,
+        }, f, ensure_ascii=False, indent=2)
+        f.flush()
+    os.replace(temp_path, path)
+
+
+def _load_book_sidecar(json_out: str, length: int) -> dict[int, str]:
+    """从侧车目录 + legacy 整份 JSON 恢复已完成的段（resume 依据）。"""
+    done: dict[int, str] = {}
+    sidecar_dir = _book_sidecar_dir(json_out)
+    if os.path.isdir(sidecar_dir):
+        for name in os.listdir(sidecar_dir):
+            if not name.endswith(".json"):
+                continue
+            try:
+                i = int(name[:-5])  # 去掉 ".json"
+            except ValueError:
+                continue
+            try:
+                with open(os.path.join(sidecar_dir, name), "r",
+                          encoding="utf-8") as f:
+                    payload = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if (isinstance(payload, dict)
+                    and isinstance(payload.get("result"), str)):
+                done[i] = payload["result"]
+    if os.path.exists(json_out):
+        try:
+            with open(json_out, "r", encoding="utf-8") as f:
+                legacy = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            legacy = None
+        if isinstance(legacy, list):
+            for i, val in enumerate(legacy):
+                if isinstance(val, str):
+                    done.setdefault(i, val)
+    return done
 
 
 async def process_paragraphs_async(json_in: str, json_out: str, start_count: int|list[int]=1, stop_count: int|None=None, model: str="deepseek-chat", rpm: int=15, max_concurrent: int=3):
     """
-    异步处理文本段落，直接将结果存储到 JSON 文件中
+    异步处理文本段落，将结果存为整份 JSON 文件。
 
     Args:
         json_in (str): 输入 JSON 文件路径
@@ -211,37 +408,22 @@ async def process_paragraphs_async(json_in: str, json_out: str, start_count: int
         model (str): 使用的模型，默认为"deepseek-chat"
         rpm (int): 每分钟请求数，默认为30
         max_concurrent (int): 最大并发数，默认为3
+
+    可靠性改进（相对旧实现）：
+      - 每段结果独立侧车原子写（`{json_out}.chunks/`），不再整份 JSON
+        读改写（原 O(N²) 且被全局锁串行化）。
+      - 中断后重跑同一命令只补侧车缺失的段。
+      - 重试耗尽的段记 `*.error.json`，结束时若有失败统一抛出
+        RuntimeError（非静默跳过、CLI 非零退出）；输出 JSON 保留空段为
+        null，可直接续跑。
+      - 生产环境建议改用 `proofread max`（每块原子 checkpoint + 失败即抛错）。
     """
     # 读取输入 JSON 文件
     with open(json_in, "r", encoding="utf-8") as f:
         input_paragraphs: List[dict] = json.load(f)
 
     input_paragraphs_length = len(input_paragraphs)
-
-    # 如果输出 JSON 文件已存在，读取它，继续处理；否则创建空列表
-    output_paragraphs: List[str|None] = []
-    if os.path.exists(json_out):
-        try:
-            with open(json_out, "r", encoding="utf-8") as f:
-                output_paragraphs = json.load(f)
-
-            # 确保输出 JSON 的长度与输入 JSON 相同
-            if len(output_paragraphs) != input_paragraphs_length:
-                # 如果长度不同，中断处理
-                raise ValueError(f"输出 JSON 的长度与输入 JSON 的长度不同: {len(output_paragraphs)} != {input_paragraphs_length}")
-        except (json.JSONDecodeError, FileNotFoundError):
-            # 如果文件不存在或格式错误，创建新的输出列表
-            output_paragraphs = [None] * input_paragraphs_length
-    else:
-        # 创建与输入 JSON 长度相同的空列表
-        output_paragraphs = [None] * input_paragraphs_length
-
-        # 确保输出目录存在
-        os.makedirs(os.path.dirname(json_out), exist_ok=True)
-
-        # 创建初始的输出 JSON 文件
-        with open(json_out, "w", encoding="utf-8") as f:
-            json.dump(output_paragraphs, f, ensure_ascii=False, indent=2)
+    done = _load_book_sidecar(json_out, input_paragraphs_length)
 
     # 确定要处理的段落索引
     indices_to_process = []
@@ -252,13 +434,13 @@ async def process_paragraphs_async(json_in: str, json_out: str, start_count: int
         stop_index = input_paragraphs_length - 1 if stop_count is None else stop_count - 1
 
         for i in range(start_index, stop_index + 1):
-            if i < input_paragraphs_length and output_paragraphs[i] is None:
+            if i < input_paragraphs_length and i not in done:
                 indices_to_process.append(i)
     elif isinstance(start_count, list):
         # 处理指定索引的段落
         for idx in start_count:
             i = idx - 1  # 转换为 0-indexed
-            if 0 <= i < input_paragraphs_length and output_paragraphs[i] is None:
+            if 0 <= i < input_paragraphs_length and i not in done:
                 indices_to_process.append(i)
 
     # 创建日志文件
@@ -271,12 +453,10 @@ async def process_paragraphs_async(json_in: str, json_out: str, start_count: int
         log_file.write(f"最大并发数: {max_concurrent}\n")
         log_file.write(f"{'='*50}\n\n")
 
-    # 创建限速器和信号量
+    # 创建限速器和信号量（每段只 await 一次限速）
     rate_limiter = RateLimiter(rpm)
     semaphore = asyncio.Semaphore(max_concurrent)
-
-    # 创建文件锁，用于安全地更新 JSON 文件
-    file_lock = asyncio.Lock()
+    failed: List[int] = []
 
     # 定义异步处理任务
     async def process_one(i):
@@ -291,87 +471,68 @@ async def process_paragraphs_async(json_in: str, json_out: str, start_count: int
 
             # 加标签，合并
             pre_text = f"<reference>\n{reference_text}\n</reference>" if reference_text else ""
-            # 合并位置的优劣有待测试  TODO
             if is_with_context:
                 pre_text += f"\n<context>\n{context_text}\n</context>"
             post_text = f"<target>\n{target_text}\n</target>"
 
             start_time = time.time()
 
-            # 等待限速器
-            await rate_limiter.wait()
-
             # 调用相应的 API
             processed_text = None
             if model.startswith("deepseek"):
-                processed_text = await deepseek_async(post_text, pre_text, model, rate_limiter)
+                processed_text = await deepseek_async(
+                    post_text, pre_text, model, rate_limiter,
+                    request_label=f"book {i + 1}/{input_paragraphs_length}",
+                )
             elif model == "google":
                 processed_text = await chat_google_async(pre_text+'\n'+post_text, rate_limiter)
             else:
                 print(f"不支持的模型: {model}")
+                failed.append(i)
+                _atomic_write_book_error(
+                    json_out, i, target_text, f"不支持的模型: {model}")
                 return
 
-            end_time = time.time()
-            elapsed = end_time - start_time
+            elapsed = time.time() - start_time
 
             if processed_text:
-                # 如果成功获取结果，更新输出 JSON
-                async with file_lock:
-                    try:
-                        # 重新读取 JSON 文件，以防其他任务已经更新了它
-                        with open(json_out, "r", encoding="utf-8") as f:
-                            current_output = json.load(f)
-
-                        # 更新当前段落的处理结果
-                        current_output[i] = processed_text
-
-                        # 保存更新后的 JSON
-                        with open(json_out, "w", encoding="utf-8") as f:
-                            json.dump(current_output, f, ensure_ascii=False, indent=2)
-                    except (FileNotFoundError, json.JSONDecodeError) as e:
-                        print(f"更新 JSON 文件时出错: {str(e)}")
-                        # 如果文件不存在或格式错误，重新创建
-                        current_output: List[str|None] = [None] * input_paragraphs_length
-                        current_output[i] = processed_text
-                        with open(json_out, "w", encoding="utf-8") as f:
-                            json.dump(current_output, f, ensure_ascii=False, indent=2)
-
+                _atomic_write_book_chunk(json_out, i, processed_text)
                 print(f"完成 {i+1}/{input_paragraphs_length} 长度 {len(target_text)} 用时 {elapsed:.2f}s\n{'-'*40}\n")
-
-                # 记录日志
-                async with file_lock:
-                    with open(log_file_path, "a", encoding="utf-8") as log_file:
-                        log_file.write(f"完成 {i+1}/{input_paragraphs_length} 长度 {len(target_text)} 用时 {elapsed:.2f}s\n")
+                with open(log_file_path, "a", encoding="utf-8") as log_file:
+                    log_file.write(f"完成 {i+1}/{input_paragraphs_length} 长度 {len(target_text)} 用时 {elapsed:.2f}s\n")
             else:
-                print(f"段落 {i+1}/{input_paragraphs_length}: 处理失败，跳过\n{'-'*40}\n")
+                failed.append(i)
+                _atomic_write_book_error(
+                    json_out, i, target_text, "API 重试耗尽（空响应或异常）")
+                print(f"段落 {i+1}/{input_paragraphs_length}: 重试耗尽，记入 error checkpoint\n{'-'*40}\n")
+                with open(log_file_path, "a", encoding="utf-8") as log_file:
+                    log_file.write(f"段落 {i+1}/{input_paragraphs_length}: 处理失败\n")
+                    log_file.write(f"原文: {target_text.strip().splitlines()[0][:20]}...\n{'-'*40}\n")
 
-                # 记录日志
-                async with file_lock:
-                    with open(log_file_path, "a", encoding="utf-8") as log_file:
-                        log_file.write(f"段落 {i+1}/{input_paragraphs_length}: 处理失败，跳过\n")
-                        log_file.write(f"原文: {target_text.strip().splitlines()[0][:20]}...\n{'-'*40}\n")
+    if indices_to_process:
+        await asyncio.gather(*(process_one(i) for i in indices_to_process))
 
-    # 如果没有需要处理的段落，直接返回
-    if not indices_to_process:
-        print("没有需要处理的段落")
-        return output_paragraphs
-
-    # 创建所有任务
-    tasks = [process_one(i) for i in indices_to_process]
-
-    # 等待所有任务完成
-    await asyncio.gather(*tasks)
+    # 合并侧车 → 整份输出 JSON（只写一次）
+    final_output: List[str | None] = [None] * input_paragraphs_length
+    for i in range(input_paragraphs_length):
+        path = _book_sidecar_path(json_out, i)
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                if isinstance(payload.get("result"), str):
+                    final_output[i] = payload["result"]
+            except (OSError, json.JSONDecodeError):
+                pass
+    if os.path.dirname(json_out):
+        os.makedirs(os.path.dirname(json_out), exist_ok=True)
+    with open(json_out, "w", encoding="utf-8") as f:
+        json.dump(final_output, f, ensure_ascii=False, indent=2)
 
     # 记录处理完成信息
     with open(log_file_path, "a", encoding="utf-8") as log_file:
         log_file.write(f"\n{'='*50}\n")
         log_file.write(f"处理结束时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-
-        # 重新读取输出 JSON 以获取最新状态
-        with open(json_out, "r", encoding="utf-8") as f:
-            final_output = json.load(f)
-
-        # 统计已处理和未处理的段落数
         processed_count = sum(1 for p in final_output if p is not None)
         processed_length = sum(len(p) for p in final_output if p is not None)
         log_file.write(f"已处理段落数、字数: {processed_count}/{input_paragraphs_length}, {processed_length}/{sum(len(p) for p in input_paragraphs)}\n")
@@ -380,10 +541,20 @@ async def process_paragraphs_async(json_in: str, json_out: str, start_count: int
 
     # 生成 Markdown 文件
     md_file_path = f"{json_out}.md"
-    with open(md_file_path, "w", encoding="utf-8") as f:
-        # 只包含已处理的段落
-        processed_paragraphs = [p for p in final_output if p is not None]
-        f.write("\n\n".join(processed_paragraphs))
+    processed_paragraphs = [p for p in final_output if p is not None]
+    if processed_paragraphs:
+        with open(md_file_path, "w", encoding="utf-8") as f:
+            f.write("\n\n".join(processed_paragraphs))
+
+    if failed:
+        failed_list = ", ".join(f"第{i+1}段" for i in sorted(failed)[:20])
+        raise RuntimeError(
+            f"book 审校有 {len(failed)}/{len(indices_to_process)} 段重试耗尽"
+            f"（{failed_list}{'…' if len(failed) > 20 else ''}）；"
+            f"输出已保留在 {json_out}（失败段为 null），"
+            f"请检查 API 配额/网络后重跑同一命令续跑（已完成的段零模型调用）。"
+            f"生产环境建议改用 `proofread max`（每块原子 checkpoint、失败即抛错）。"
+        )
 
     return final_output
 

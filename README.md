@@ -84,6 +84,7 @@ proofread s  <file.md>                   # TGSCC 汉字规范专项检查
 | `--model` | 模型选择：`deepseek-v4-flash`（默认）/ `deepseek-v4-pro` / 旧名 |
 | `--concurrent N` | LLM 并发数（book/max 模式，默认 3） |
 | `--rpm N` | API 速率限制（默认 15） |
+| `--chunk-size N` | max 分块目标字数（默认 200；质量回归通过前不要改默认） |
 | `--names` | max 模式启用专名查词（需词典） |
 | `--no-view` | 不自动打开浏览器 |
 | `--no-diff` | 不生成 diff HTML |
@@ -236,13 +237,15 @@ Phase 1（LLM JSON 发现模式）是唯一耗时/成本瓶颈：16 万字书稿
 `--concurrent 3 --rpm 15` 下耗时 **~3 小时**，实测 token 消耗约 235 万
 （输入 94% / 输出 6%），成本约 ¥5。
 
-**推荐长稿参数（提速约 5 倍，质量不变）：**
+**当前安全默认：**
 
 ```zsh
-proofread m 书稿.md --no-view --concurrent 8 --rpm 60
+proofread m 书稿.md --no-view --concurrent 3 --rpm 15 --chunk-size 200
 ```
 
-- 并发不影响审校质量——每个 chunk 是独立、同 prompt 的调用。
+- max Phase 1 每块结果会写入源哈希、模型、JSON prompt 哈希、chunk-size 和 chunk 哈希绑定的原子 checkpoint；中断后只补失败块，合法 `issues: []` 不会重跑。
+- SDK 隐式重试已关闭，请求上限 300 秒；每个逻辑请求最多初次请求加两次显式重试，并记录限速等待、请求时间、空响应和无效 JSON。
+- `max` 会输出阶段 wall time、实际调用数和 checkpoint 命中数。不要在未经质量回归前把并发或 RPM 提高到 8/60。
 - 三处 token 优化已内置：`max_tokens=4096`（JSON 发现模式）、context 裁剪
   （每块只带章节标题 + target 前后 800 字，token 降 38%）、无空行句子硬切。
 - 详情见 `CLAUDE.md` 的 Performance tuning 章节。
