@@ -2,6 +2,21 @@
   "version": 1,
   "levels": [
     {
+      "id": "part",
+      "name": "部",
+      "level": 1,
+      "enabled": true,
+      "optional": true,
+      "priority": 105,
+      "pattern": "(?:第(?P<num_cn>[一二三四五六七八九十百千零〇两壹贰叁肆伍陆柒捌玖拾]+|(?P<num_ar>[0-9]+)|(?P<num_rm>[IVXLCDM]+))(?:部分|部|编|篇|卷|册)|(?:卷|部)(?P<num_cn2>[一二三四五六七八九十百千零〇两]+|(?P<num_rm2>[IVXLCDM]+)))",
+      "notes": "匹配 第一部/第1部分/卷一/卷X 等（无第前缀的 卷一 也识别；continuity=none 不比较）",
+      "numbering": {
+        "normalize": ["cn", "arabic", "roman"],
+        "continuity": "none"
+      },
+      "children": ["chapter", "section", "cn_item", "paren_cn", "ar_punct", "num_dot", "subsection", "special"]
+    },
+    {
       "id": "chapter",
       "name": "章",
       "level": 1,
@@ -42,9 +57,76 @@
         "continuity": "increase_or_restart"
       },
       "children": []
+    },
+    {
+      "id": "cn_item",
+      "name": "中文序号",
+      "level": 3,
+      "enabled": true,
+      "optional": true,
+      "priority": 79,
+      "pattern": "(?P<num_cn>[一二三四五六七八九十百千零〇两]+)、",
+      "numbering": {
+        "normalize": ["cn"],
+        "continuity": "increase_or_restart"
+      },
+      "children": []
+    },
+    {
+      "id": "paren_cn",
+      "name": "括号序号",
+      "level": 3,
+      "enabled": true,
+      "optional": true,
+      "priority": 78,
+      "pattern": "[（(](?P<num_cn>[一二三四五六七八九十百千零〇两]+)[）)]",
+      "numbering": {
+        "normalize": ["cn"],
+        "continuity": "increase_or_restart"
+      },
+      "children": []
+    },
+    {
+      "id": "ar_punct",
+      "name": "数字顿号",
+      "level": 3,
+      "enabled": true,
+      "optional": true,
+      "priority": 77,
+      "pattern": "(?P<num_ar>[0-9]+)、",
+      "numbering": {
+        "normalize": ["arabic"],
+        "continuity": "increase_or_restart"
+      },
+      "children": []
+    },
+    {
+      "id": "num_dot",
+      "name": "多级数字",
+      "level": 3,
+      "enabled": true,
+      "optional": true,
+      "priority": 76,
+      "pattern": "(?P<num_ar>[0-9]+(?:\\.[0-9]+)+)(?=\\D|$)",
+      "numbering": {
+        "normalize": ["arabic"],
+        "continuity": "none"
+      },
+      "children": []
+    },
+    {
+      "id": "special",
+      "name": "特殊部分",
+      "level": 1,
+      "enabled": true,
+      "optional": true,
+      "priority": 40,
+      "pattern": "(?:前言|绪论|引言|序言|结语|结论|附录|后记|参考文献|致谢|注释|索引|后序)(?:[A-Za-z0-9一二三四五六七八九十百]+)?(?=$|[ \\t　:：·、])",
+      "numbering": {
+        "normalize": ["arabic"],
+        "continuity": "none"
+      },
+      "children": []
     }
   ]
 }
-
-
-

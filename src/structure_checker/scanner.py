@@ -23,7 +23,7 @@ _DECOR_PART = re.compile(
     r"^(?:[（(【［「『《〈〔｛<\"'“”‘’`]+"
     r"|[ \t　]+"
     r"|[-+*][ \t　]+"
-    r"|第[一二三四五六七八九十百千零〇0-9０-９]+(?:部分|编|篇|卷|册)[ \t　]*)")
+    r"|第[一二三四五六七八九十百千零〇0-9０-９]+(?:部分|部|编|篇|卷|册)[ \t　]*)")
 
 
 def _strip_decorators(content: str, content_start: int) -> Tuple[str, int]:
@@ -34,6 +34,49 @@ def _strip_decorators(content: str, content_start: int) -> Tuple[str, int]:
         content = content[m.end():]
         content_start += m.end()
     return content, content_start
+
+
+# 不剥开圆括号的装饰（供 paren_cn 匹配「（一）」等括号序号）。
+# 只剥空白/列表符/引号；保留 （ ( 等让 paren_cn 规则有机会锚定。
+_DECOR_PART_NO_BRACKET = re.compile(
+    r"^(?:[ \t　]+|[-+*][ \t　]+|[「『‘“”\"'`]+)")
+
+
+def _strip_decorators_no_bracket(
+        content: str, content_start: int) -> Tuple[str, int]:
+    m = _DECOR_PART_NO_BRACKET.match(content)
+    if not m or m.end() == 0:
+        return content, content_start
+    return content[m.end():], content_start + m.end()
+
+
+def _match_part_only(
+        content: str, content_start: int,
+        compiled: List[Tuple[Rule, "re.Pattern"]],
+        heading_level: int | None, line_id: int | None) -> List[Token]:
+    """用 part 规则锚定内容起点，返回「第X部/编/卷」token（最多一个）。"""
+    norm, offmap = _normalize_for_match(content)
+    for rule, pat in compiled:
+        if rule.id != "part":
+            continue
+        pm = pat.match(norm)
+        if pm is None:
+            continue
+        num_val = normalize_number(pm.groupdict(), rule.numbering_normalize)
+        start = content_start + offmap[pm.start()]
+        end = content_start + offmap[pm.end() - 1] + 1
+        return [Token(
+            start=start,
+            end=end,
+            rule_id="part",
+            level=rule.level,
+            priority=rule.priority,
+            raw_text=content[offmap[pm.start()]:offmap[pm.end() - 1] + 1],
+            number_value=num_val,
+            heading_level=heading_level,
+            line_id=line_id,
+        )]
+    return []
 
 
 # 全角字符 → ASCII（用于标题内容归一化后再匹配规则，保持偏移不变）：
@@ -101,106 +144,152 @@ def _match_rules(
     常见的全角数字「第１章」「1．」会先归一化为 ASCII 再匹配；token 偏移映射
     回原文，raw_text 用原文子串，report 高亮与偏移切片不受影响。
     """
-    content, content_start = _strip_decorators(content, content_start)
-    norm, offmap = _normalize_for_match(content)
-    out: List[Token] = []
+    def _match_content_once(c: str, cs: int) -> List[Token]:
+        """对给定标题内容做「锚定 + 合并」匹配，返回 token 列表。"""
+        norm, offmap = _normalize_for_match(c)
+        out: List[Token] = []
 
-    def _make_token(rule: Rule, m: "re.Match") -> Token | None:
-        num_val = normalize_number(m.groupdict(), rule.numbering_normalize)
-        start = content_start + offmap[m.start()]
-        end = content_start + offmap[m.end() - 1] + 1
-        return Token(
-            start=start,
-            end=end,
-            rule_id=rule.id,
-            level=rule.level,
-            priority=rule.priority,
-            raw_text=content[offmap[m.start()]:offmap[m.end() - 1] + 1],
-            number_value=num_val,
-            heading_level=heading_level,
-            line_id=line_id,
-        )
+        def _token_level(rule: Rule, m: "re.Match") -> int:
+            # 多级数字（1.1 / 1.1.1）按点数映射层级：1.1→节(2)、1.1.1→目(3)
+            if rule.id == "num_dot":
+                return m.group(0).count(".") + 1
+            return rule.level
 
-    # 目编号（N.）歧义检查：编号后（含空白后）若紧跟"数字+量词单位"且
-    # **单位之后无其他词**（12. 5亿 → "5亿"后即结束），是纯数量/小数；
-    # 若单位后还有名词（1. 2亿用户 → "2亿"后接"用户"），是真编号小节标题，
-    # 保留。规则正则的 (?=\D|$) 只挡「点后紧贴数字」。
-    _UNIT_AFTER_NUM = re.compile(r"^([0-9]+[亿萬億万元元％%])([^，。；;]*)")
+        def _make_token(rule: Rule, m: "re.Match") -> Token | None:
+            num_val = normalize_number(m.groupdict(), rule.numbering_normalize)
+            start = cs + offmap[m.start()]
+            end = cs + offmap[m.end() - 1] + 1
+            return Token(
+                start=start,
+                end=end,
+                rule_id=rule.id,
+                level=_token_level(rule, m),
+                priority=rule.priority,
+                raw_text=c[offmap[m.start()]:offmap[m.end() - 1] + 1],
+                number_value=num_val,
+                heading_level=heading_level,
+                line_id=line_id,
+            )
 
-    def _is_subsection_decimal(rule: Rule, m: "re.Match") -> bool:
-        if rule.id != "subsection":
+        # 目编号（N.）歧义检查：编号后（含空白后）若紧跟"数字+量词单位"且
+        # **单位之后无其他词**（12. 5亿 → "5亿"后即结束），是纯数量/小数；
+        # 若单位后还有名词（1. 2亿用户 → "2亿"后接"用户"），是真编号小节标题，
+        # 保留。规则正则的 (?=\D|$) 只挡「点后紧贴数字」。
+        _UNIT_AFTER_NUM = re.compile(r"^([0-9]+[亿萬億万元元％%])([^，。；;]*)")
+
+        def _is_subsection_decimal(rule: Rule, m: "re.Match") -> bool:
+            if rule.id not in ("subsection", "num_dot"):
+                return False
+            rest = norm[m.end():].lstrip(" \t　")
+            if rule.id == "subsection":
+                um = _UNIT_AFTER_NUM.match(rest)
+                if not um:
+                    return False
+                return not um.group(2).strip(" \t　")  # 单位后无其他词 → 纯数量
+            # num_dot（1.1 / 12.9 / 2024.1）：
+            #   - 后跟量词单位（12.9亿 / 12. 5亿）→ 纯数量/小数
+            #   - 点前是 4 位年份（2024.1）→ 日期
+            # 否则是真多级编号（1.1 研究背景）保留
+            if re.match(r"^[0-9]*[亿萬億万元元％%]", rest):
+                return True
+            head = m.group(0).split(".")[0]
+            if head.isdigit() and len(head) == 4 and 1900 <= int(head) <= 2099:
+                return True
             return False
-        rest = norm[m.end():].lstrip(" \t　")
-        um = _UNIT_AFTER_NUM.match(rest)
-        if not um:
-            return False
-        return not um.group(2).strip(" \t　")  # 单位后无其他词 → 纯数量/小数
 
-    # 起点匹配（保留 require_space_after 语义：普通行编号后须空白）
-    seed_norm_end = 0
-    for rule, pat in compiled:
-        if plain_only_prefix and not re.match(r"\(?第", rule.pattern):
-            continue
-        pm = pat.match(norm)
-        if pm is None:
-            continue
-        if require_space_after:
-            after = norm[pm.end():]
-            if after and after[0] not in " \t　":
-                continue
-        if _is_subsection_decimal(rule, pm):
-            continue
-        out.append(_make_token(rule, pm))
-        seed_norm_end = max(seed_norm_end, pm.end())
-
-    # 合并：标题行内后续编号（合并标题「第1章 第1节」「第一章 第一节」）。
-    # 只接受「规则层级严格递增 + 编号间仅空白/空」的连续编号——这是标题自身
-    # 层级结构的信号；叙述性提及（罗杰斯第三章书评 / 第二章的比较 /
-    # 参考文献「第2章」）不满足「层递」或「紧邻前一编号」，被排除。
-    if out:
-        last_end = seed_norm_end
-        max_level = max(t.level for t in out)
-        candidates = []
+        # 起点匹配（保留 require_space_after 语义：普通行章节号后须空白）
+        seed_norm_end = 0
         for rule, pat in compiled:
-            if plain_only_prefix and not re.match(r"\(?第", rule.pattern):
+            if plain_only_prefix and rule.id in ("special", "subsection", "num_dot"):
+                continue  # 普通行排除易与列表/正文混淆的规则（数字句点/特殊词）
+            pm = pat.match(norm)
+            if pm is None:
                 continue
-            for m in pat.finditer(norm, seed_norm_end):
-                candidates.append((m.start(), m.end(), rule, m))
-        candidates.sort(key=lambda x: (x[0], x[1]))
-        for start, end, rule, m in candidates:
-            if start < last_end:
+            if require_space_after and rule.id in ("chapter", "section"):
+                after = norm[pm.end():]
+                if after and after[0] not in " \t　":
+                    continue
+            if _is_subsection_decimal(rule, pm):
                 continue
-            # 编号间只能空白/空，或至多一个「第」字（「第1.小节」的 1. 前缀）。
-            # 叙述性提及（第二章的比较 / 参考文献「第2章」）含正文词 → 排除；
-            # 同层重复（第二章 第二章）被下面的 level 递增挡住。
-            if norm[last_end:start].strip(" \t　") not in ("", "第"):
-                continue
-            if rule.level <= max_level:
-                continue  # 层级必须严格递增（章→节→目）
-            if _is_subsection_decimal(rule, m):
-                continue
-            # 编号后检查（防幽灵节 / 防普通行叙述行）。只对「第X章/第X节」
-            # 生效：它们后紧跟无空白的正文词（第一章 第一节的比较）是叙述；
-            # 「N.」目编号后紧跟正文词（第1.小节 / 1. 2亿用户）是正常标题，
-            # 不检查。
-            if rule.id in ("chapter", "section"):
-                if require_space_after:
-                    # 普通文本行：合并编号后也须空白（与起点一致），
-                    # 「第1章 第1节内容见第三章」的第1节是叙述 → 排除
-                    after = norm[end:]
-                    if after and after[0] not in " \t　":
+            out.append(_make_token(rule, pm))
+            seed_norm_end = max(seed_norm_end, pm.end())
+
+        # 合并：标题行内后续编号（合并标题「第1章 第1节」「第一章 第一节」）。
+        # 只接受「规则层级严格递增 + 编号间仅空白/空」的连续编号——这是标题自身
+        # 层级结构的信号；叙述性提及（罗杰斯第三章书评 / 第二章的比较 /
+        # 参考文献「第2章」）不满足「层递」或「紧邻前一编号」，被排除。
+        if out:
+            last_end = seed_norm_end
+            max_level = max(t.level for t in out)
+            part_child_extended = False  # 是否已合并 part 的（同 level）子级
+            candidates = []
+            for rule, pat in compiled:
+                if plain_only_prefix and rule.id in ("special", "subsection", "num_dot"):
+                    continue
+                for m in pat.finditer(norm, seed_norm_end):
+                    candidates.append((m.start(), m.end(), rule, m))
+            candidates.sort(key=lambda x: (x[0], x[1]))
+            for start, end, rule, m in candidates:
+                if start < last_end:
+                    continue
+                # 编号间只能空白/空，或至多一个「第」字（「第1.小节」的 1. 前缀）。
+                # 叙述性提及（第二章的比较 / 参考文献「第2章」）含正文词 → 排除；
+                # 同层重复（第二章 第二章）被下面的 level 递增挡住。
+                if norm[last_end:start].strip(" \t　") not in ("", "第"):
+                    continue
+                if _token_level(rule, m) <= max_level:
+                    # part 允许同级的声明子级（卷一 第一章：part=1, chapter=1）。
+                    # 只放行第一个扩展；之后仍同级（卷一 第一章 第二章）排除。
+                    if (not part_child_extended
+                            and any(t.rule_id == "part" for t in out)
+                            and rule.id in ("chapter", "section", "subsection")):
+                        part_child_extended = True
+                    else:
                         continue
-                else:
-                    # ATX 标题：合并编号后若紧跟正文词（非空白、非"第"、
-                    # 非数字），是叙述性提及（第一章 第一节的比较）→ 排除
-                    after = norm[end:]
-                    if (after and after[0] not in " \t　"
-                            and not after.startswith("第") and not after[0].isdigit()):
-                        continue
-            out.append(_make_token(rule, m))
-            last_end = end
-            max_level = rule.level
-    return out
+                if _is_subsection_decimal(rule, m):
+                    continue
+                # 编号后检查（防幽灵节 / 防普通行叙述行）。只对「第X章/第X节」
+                # 生效：它们后紧跟无空白的正文词（第一章 第一节的比较）是叙述；
+                # 「N.」目编号后紧跟正文词（第1.小节 / 1. 2亿用户）是正常标题，
+                # 不检查。
+                if rule.id in ("chapter", "section"):
+                    if require_space_after:
+                        # 普通文本行：合并编号后也须空白（与起点一致），
+                        # 「第1章 第1节内容见第三章」的第1节是叙述 → 排除
+                        after = norm[end:]
+                        if after and after[0] not in " \t　":
+                            continue
+                    else:
+                        # ATX 标题：合并编号后若紧跟正文词（非空白、非"第"、
+                        # 非数字），是叙述性提及（第一章 第一节的比较）→ 排除
+                        after = norm[end:]
+                        if (after and after[0] not in " \t　"
+                                and not after.startswith("第") and not after[0].isdigit()):
+                            continue
+                out.append(_make_token(rule, m))
+                last_end = end
+                max_level = _token_level(rule, m)
+        return out
+
+    # 第一遍：剥离装饰前缀后锚定——捕获「（第一章）」「第一章」等。
+    stripped, stripped_start = _strip_decorators(content, content_start)
+    out = _match_content_once(stripped, stripped_start)
+    if out:
+        # 剥离掉 part 前缀（第一部/第1卷/第1部分）时，总是补充 part token：
+        # 「第一部 第1节」「第一部 第一章」都保留部级。out 已含 part
+        # （卷一 第1节 seed 命中）时不重复补。
+        if not any(t.rule_id == "part" for t in out):
+            part_toks = _match_part_only(
+                content, content_start, compiled, heading_level, line_id)
+            if part_toks:
+                return part_toks + out
+        return out
+    # 第二遍：剥离非括号装饰后锚定——捕获「（一）」「- （一）」「第一部」等。
+    # 括号序号的开括号不是装饰，须保留给 paren_cn 规则（_strip_decorators
+    # 会把 （ 当装饰剥掉，导致括号序号漏检）。
+    second, second_start = _strip_decorators_no_bracket(
+        content, content_start)
+    return _match_content_once(second, second_start)
 
 
 def scan_text(text: str, rules: List[Rule]) -> Tuple[List[Token], List[Diagnostic]]:

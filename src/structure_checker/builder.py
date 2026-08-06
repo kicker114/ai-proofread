@@ -44,10 +44,39 @@ def build_tree(tokens: List[Token], rule_map: Dict[str, Rule]) -> Tuple[List[Nod
         node.line_max_level = line_max.get(node.token.line_id, 0)
 
     for node in nodes:
+        # 同号 part 合并：第1卷 第1节 / 第1卷 第3节 是同一卷的延续，复用已有
+        # part 根，使卷内节/部内章的连续性能被比较。仅当编号相同**且单位相同**
+        # （第一部 vs 卷一 是不同单位，不合并）才复用。
+        if node.token.rule_id == "part":
+            match = next(
+                (r for r in roots
+                 if r.rule_id == "part"
+                 and r.token.number_value is not None
+                 and r.token.number_value == node.token.number_value
+                 and _part_unit(r) == _part_unit(node)),
+                None)
+            if match is not None:
+                stack = [match]
+                continue
         # 清理无效 number 的情况：不致命，后续连续性检查会处理
         while stack and not _same_line(node, stack[-1]) \
-                and _node_real_level(node) <= _node_real_level(stack[-1]):
+                and _node_real_level(node) <= _node_real_level(stack[-1]) \
+                and not (stack[-1].rule_id == "part"
+                         and node.rule_id != "part"
+                         and node.level >= stack[-1].level):
             stack.pop()
+        # part（部/编/卷）后紧跟的节点（章/节/目）：即使与 part 同为 H1 或同级，
+        # 也挂到 part 下（卷→节 / 部→章 结构），否则会成孤立根误报 gap。
+        if stack and stack[-1].rule_id == "part" \
+                and node.rule_id != "part" \
+                and node.level >= stack[-1].level \
+                and not _same_line(node, stack[-1]):
+            parent = stack[-1]
+            parent.children.append(node)
+            node.parent = parent
+            stack.append(node)
+            _check_hierarchy(parent, node, rule_map, diags)
+            continue
         # 同一行内：后出现的编号若规则层级更深（章→节），直接作为子嵌套
         if stack and _same_line(node, stack[-1]) \
                 and _node_structure_level(node) > _node_structure_level(stack[-1]):
@@ -118,10 +147,20 @@ def _check_hierarchy(
     if parent_rule is None or node_rule is None:
         return  # 虚拟根或未知规则，跳过
 
+    # part（部/编/卷）允许章/节/目等声明的子级（卷→节 结构常见），
+    # 即使二者同为 H1（跨行挂载）。
+    if parent.rule_id == "part" and node.rule_id in (parent_rule.children or []):
+        return
+
     # 同一标题行内的多层编号（如合并标题「第1章 第1节」的章+节）：按规则
     # 层级嵌套，不是层级跳变，直接放行（建树已按结构层级挂好）。
     if _same_line(parent, node):
         if node.token.level > parent.token.level:
+            return
+        # part（部/编/卷）允许同行的章/节/目子级（「第一卷 第一章」），
+        # 即使二者同 level 1（卷→章 是同层级的包含关系）
+        if (parent.rule_id == "part"
+                and node.rule_id in (parent_rule.children or [])):
             return
         # 同级/反序（如「第1章 第1章」）属异常，仍报 level_mismatch
         parent_rule = rule_map.get(parent.rule_id)
@@ -169,6 +208,10 @@ def _check_hierarchy(
     allowed_children = parent_rule.children
     if allowed_children and node.rule_id in allowed_children:
         return  # 合法直接子规则
+    # 柔性小节（中文序号/括号序号/数字顿号）：章/节下直接出现是中文书稿
+    # 常见写法（纯文本 第一章 → 一、），不视为层级跳变
+    if node_rule.id in ("cn_item", "paren_cn", "ar_punct"):
+        return
 
     # 不合法嵌套
     if n_lvl > p_lvl + 1:
@@ -230,98 +273,123 @@ def _first_section_number(n: Node) -> int | None:
     return None
 
 
+def _part_unit(n: Node) -> str:
+    """part token 的单位字（部/卷/编/篇/册），用于区分不同单位的同号 part。"""
+    rt = n.token.raw_text
+    m = re.search(r"(部分|部|编|篇|卷|册)$", rt)
+    return m.group(1) if m else ""
+
+
 def validate_continuity(roots: List[Node], rule_map: Dict[str, Rule]) -> List[Diagnostic]:
     diags: List[Diagnostic] = []
 
     def dfs(parent: Node):
         if not parent.children:
             return
-        # 在同一父节点下检查连续性
-        # 将同层的子节点按 rule_id 分桶，分别检查
-        buckets: Dict[str, List[Node]] = {}
+        # 按 part 边界切分：part 是层级边界——部/编/卷内的章节编号会重新起算
+        # （第一部 第1-3章 → 第二部 第1-2章）。每段内部检查连续性，跨 part
+        # 不比较编号，避免「2 → 1」这类部边界误报。
+        segments: List[List[Node]] = [[]]
+        last_part_num: int | None = None
         for c in parent.children:
-            buckets.setdefault(c.rule_id, []).append(c)
+            if c.rule_id == "part":
+                # part 作为切分边界：**卷号变化**才切段（第一部→第二部）。
+                # 同卷多次出现（第1卷 第1节 / 第1卷 第3节）是同一卷的延续，
+                # 不切分，使卷内节号 1→3 跳号仍被检查。
+                if (last_part_num is not None
+                        and c.token.number_value != last_part_num):
+                    segments.append([])
+                last_part_num = c.token.number_value
+            else:
+                segments[-1].append(c)
+        for segment in segments:
+            if not segment:
+                continue
+            # 段内：将同层子节点按 rule_id 分桶，分别检查
+            buckets: Dict[str, List[Node]] = {}
+            for c in segment:
+                buckets.setdefault(c.rule_id, []).append(c)
 
-        for rid, items in buckets.items():
-            rule = rule_map[rid]
-            # 混合编号体系占位检测：桶内既有阿拉伯/中文编号，又有单字母罗马
-            # （草稿占位「第X章」/附录「第C章」）→ 单字母罗马判为占位，
-            # number 置 None 触发 number_missing，而非连续性误报。
-            systems = {_numbering_system(n) for n in items}
-            single_romans = [n for n in items if _is_single_letter_roman(n)]
-            if len(systems) > 1 and single_romans:
-                for n in single_romans:
-                    n.token.number_value = None
+            for rid, items in buckets.items():
+                rule = rule_map[rid]
+                # 混合编号体系占位检测：桶内既有阿拉伯/中文编号，又有单字母罗马
+                # （草稿占位「第X章」/附录「第C章」）→ 单字母罗马判为占位，
+                # number 置 None 触发 number_missing，而非连续性误报。
+                systems = {_numbering_system(n) for n in items}
+                single_romans = [n for n in items if _is_single_letter_roman(n)]
+                if len(systems) > 1 and single_romans:
+                    for n in single_romans:
+                        n.token.number_value = None
 
-            prev = None
-            prev_node: Node | None = None
-            seq = []
-            for n in items:
-                seq.append((n, n.token.number_value))
-                if rule.numbering_continuity == "none":
-                    continue
-                if n.token.number_value is None:
-                    diags.append(Diagnostic(
-                        kind="number_missing",
-                        message=f"{rule.name} 缺少可解析编号",
-                        position=(n.token.start, n.token.end),
-                        extra={"rule": rid, "text": n.token.raw_text},
-                    ))
-                    continue
-                if prev is None:
-                    prev = n.token.number_value
-                    prev_node = n
-                else:
-                    curr = n.token.number_value
-                    # 编号体系切换（罗马前言 I/II → 阿拉伯正文 1/2，或中文→阿拉伯）：
-                    # 数值不可比，不检查连续性（真实书稿常见"前言罗马 + 正文阿拉伯"）
-                    if (prev_node is not None
-                            and _numbering_system(prev_node) != _numbering_system(n)):
-                        prev = curr
-                        prev_node = n
+                prev = None
+                prev_node: Node | None = None
+                seq = []
+                for n in items:
+                    seq.append((n, n.token.number_value))
+                    if rule.numbering_continuity == "none":
                         continue
-                    if rule.numbering_continuity == "strict_increase":
-                        # 合并标题多行展开：同一章号重复（第1章 第1节 /
-                        # 第1章 第2节），仅当**前后两行都含更深层编号**（同章
-                        # 多节展开）才合法；同时检查两行的节号连续性
-                        # （第1章 第1节 / 第1章 第3节 → 节 1→3 应报）。
-                        if (curr == prev and n.line_max_level > n.level
-                                and prev_node is not None
-                                and prev_node.line_max_level > prev_node.level):
-                            ps = _first_section_number(prev_node)
-                            cs = _first_section_number(n)
-                            if (ps is not None and cs is not None
-                                    and cs != ps + 1):
-                                diags.append(Diagnostic(
-                                    kind="continuity_error",
-                                    message=f"{rule.name}（多节展开）节编号不连续："
-                                            f"{ps} → {cs}",
-                                    position=(n.token.start, n.token.end),
-                                    extra={"rule": rid, "prev": ps, "curr": cs,
-                                           "expand": True},
-                                ))
+                    if n.token.number_value is None:
+                        diags.append(Diagnostic(
+                            kind="number_missing",
+                            message=f"{rule.name} 缺少可解析编号",
+                            position=(n.token.start, n.token.end),
+                            extra={"rule": rid, "text": n.token.raw_text},
+                        ))
+                        continue
+                    if prev is None:
+                        prev = n.token.number_value
+                        prev_node = n
+                    else:
+                        curr = n.token.number_value
+                        # 编号体系切换（罗马前言 I/II → 阿拉伯正文 1/2，或中文→阿拉伯）：
+                        # 数值不可比，不检查连续性（真实书稿常见"前言罗马 + 正文阿拉伯"）
+                        if (prev_node is not None
+                                and _numbering_system(prev_node) != _numbering_system(n)):
                             prev = curr
                             prev_node = n
                             continue
-                        if curr != prev + 1:
-                            diags.append(Diagnostic(
-                                kind="continuity_error",
-                                message=f"{rule.name} 编号不连续：{prev} → {curr}",
-                                position=(n.token.start, n.token.end),
-                                extra={"rule": rid, "prev": prev, "curr": curr},
-                            ))
-                        prev = curr
-                        prev_node = n
-                    elif rule.numbering_continuity == "increase_or_restart":
-                        if not (curr == 1 or curr == (prev + 1)):
-                            diags.append(Diagnostic(
-                                kind="continuity_error",
-                                message=f"{rule.name} 需递增或重启为1：{prev} → {curr}",
-                                position=(n.token.start, n.token.end),
-                                extra={"rule": rid, "prev": prev, "curr": curr},
-                            ))
-                        prev = curr
-                        prev_node = n
+                        if rule.numbering_continuity == "strict_increase":
+                            # 合并标题多行展开：同一章号重复（第1章 第1节 /
+                            # 第1章 第2节），仅当**前后两行都含更深层编号**（同章
+                            # 多节展开）才合法；同时检查两行的节号连续性
+                            # （第1章 第1节 / 第1章 第3节 → 节 1→3 应报）。
+                            if (curr == prev and n.line_max_level > n.level
+                                    and prev_node is not None
+                                    and prev_node.line_max_level > prev_node.level):
+                                ps = _first_section_number(prev_node)
+                                cs = _first_section_number(n)
+                                if (ps is not None and cs is not None
+                                        and cs != ps + 1):
+                                    diags.append(Diagnostic(
+                                        kind="continuity_error",
+                                        message=f"{rule.name}（多节展开）节编号不连续："
+                                                f"{ps} → {cs}",
+                                        position=(n.token.start, n.token.end),
+                                        extra={"rule": rid, "prev": ps, "curr": cs,
+                                               "expand": True},
+                                    ))
+                                prev = curr
+                                prev_node = n
+                                continue
+                            if curr != prev + 1:
+                                diags.append(Diagnostic(
+                                    kind="continuity_error",
+                                    message=f"{rule.name} 编号不连续：{prev} → {curr}",
+                                    position=(n.token.start, n.token.end),
+                                    extra={"rule": rid, "prev": prev, "curr": curr},
+                                ))
+                            prev = curr
+                            prev_node = n
+                        elif rule.numbering_continuity == "increase_or_restart":
+                            if not (curr == 1 or curr == (prev + 1)):
+                                diags.append(Diagnostic(
+                                    kind="continuity_error",
+                                    message=f"{rule.name} 需递增或重启为1：{prev} → {curr}",
+                                    position=(n.token.start, n.token.end),
+                                    extra={"rule": rid, "prev": prev, "curr": curr},
+                                ))
+                            prev = curr
+                            prev_node = n
 
         for c in parent.children:
             dfs(c)

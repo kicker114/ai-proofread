@@ -144,7 +144,8 @@ class ScannerUnitTests(unittest.TestCase):
         cases = {
             "# （第一章）": [("chapter", "第一章", 1)],
             "# 【第三章】": [("chapter", "第三章", 3)],
-            "# 第一部分 第一章": [("chapter", "第一章", 1)],
+            "# 第一部分 第一章": [("part", "第一部分", 1),
+                                  ("chapter", "第一章", 1)],
             "# `第一章`": [("chapter", "第一章", 1)],
             "# - 第一章 序": [("chapter", "第一章", 1)],
         }
@@ -153,14 +154,18 @@ class ScannerUnitTests(unittest.TestCase):
             self.assertEqual(_kinds(tokens), expected, text)
 
     def test_subsection_rejects_decimal_and_date_at_heading_start(self):
-        # rules.example.json 的 N. 加了 (?=\D|$) 前瞻
+        # rules.example.json 的 N. 加了 (?=\D|$) 前瞻；num_dot 排除量词/年份
         for text in ["# 12.9亿的市场规模", "# 2024.1 一季度回顾",
-                     "# 3.14 的近似值"]:
+                     "# 12. 5亿", "# １２． ５億"]:
             tokens, _ = _tokens(text)
             self.assertEqual(tokens, [], text)
         # 真小节"12. 背景"（编号后空白）仍识别
         tokens, _ = _tokens("# 12. 背景\n")
         self.assertEqual(_kinds(tokens), [("subsection", "12.", 12)])
+        # "3.14 的近似值"：语法上无法区分圆周率与第3章14节，num_dot 识别为
+        # 多级编号（新规则合理行为）
+        tokens, _ = _tokens("# 3.14 的近似值\n")
+        self.assertEqual(_kinds(tokens), [("num_dot", "3.14", None)])
 
     def test_plain_ordered_list_not_subsection(self):
         # 无 # 的"1. 列表项"是列表不是目（plain_only_prefix 只认 第X章/第X节）
@@ -476,10 +481,218 @@ class ScannerIntegrationTests(unittest.TestCase):
             ("chapter", "第一章", 1), ("section", "第一节", 1)])
 
     def test_fullwidth_decor_prefix_normalized(self):
-        # 全角数字装饰前缀（第１部分 第一章）不再整行漏检
+        # 全角数字装饰前缀（第１部分 第一章）识别 part + 章
         text = "# 第１部分 第一章 标题\n"
         tokens, _ = _tokens(text)
+        self.assertEqual(_kinds(tokens), [
+            ("part", "第１部分", 1), ("chapter", "第一章", 1)])
+
+    def test_chinese_ordered_item_recognized(self):
+        # 中文序号一、二、三 识别，跳号报错
+        tokens, _ = _tokens("# 一、研究背景\n")
+        self.assertEqual(_kinds(tokens), [("cn_item", "一、", 1)])
+        tokens, _ = _tokens("# 二、研究意义\n")
+        self.assertEqual(_kinds(tokens), [("cn_item", "二、", 2)])
+        # 一、二、三 递增合法
+        result = check_text_with_rules(
+            "# 一、\n# 二、\n# 三、\n", _RULES)
+        self.assertEqual(result.diagnostics, [])
+        # 一、三、跳号报错
+        result = check_text_with_rules("# 一、\n# 三、\n", _RULES)
+        self.assertIn("continuity_error",
+                      [d.kind for d in result.diagnostics])
+
+    def test_parenthesized_chinese_item_recognized(self):
+        # 括号序号（一）（二）识别（不被装饰剥离吞掉）
+        text = "# （一）概念界定\n# （二）历史沿革\n"
+        tokens, _ = _tokens(text)
+        self.assertEqual(_kinds(tokens), [
+            ("paren_cn", "（一）", 1), ("paren_cn", "（二）", 2)])
+
+    def test_ar_punct_item_recognized_and_jump_checked(self):
+        # 数字顿号 1、2、 识别，跳号报错
+        tokens, _ = _tokens("# 1、研究方法\n# 2、数据来源\n")
+        self.assertEqual(_kinds(tokens), [
+            ("ar_punct", "1、", 1), ("ar_punct", "2、", 2)])
+        result = check_text_with_rules("# 1、\n# 3、\n", _RULES)
+        self.assertIn("continuity_error",
+                      [d.kind for d in result.diagnostics])
+
+    def test_num_dot_level_by_dot_count(self):
+        # 多级数字 1.1→节(2)、1.1.1→目(3)，量词/年份排除
+        tokens, _ = _tokens("# 1.1 研究背景\n")
+        self.assertEqual(_kinds(tokens), [("num_dot", "1.1", None)])
+        self.assertEqual(tokens[0].level, 2)
+        tokens, _ = _tokens("# 1.1.1 问题提出\n")
+        self.assertEqual(tokens[0].level, 3)
+        # 量词/年份小数排除
+        for t in ["# 12.9亿的市场规模", "# 2024.1 一季度回顾"]:
+            tokens, _ = _tokens(t)
+            self.assertEqual(tokens, [], t)
+
+    def test_part_heading_recognized(self):
+        # 部/编/卷/篇/册 独立标题识别
+        expected = {
+            "# 第一部 思想的形成": "第一部",
+            "# 第一卷 思想": "第一卷",
+            "# 第一编 总则": "第一编",
+        }
+        for t, raw in expected.items():
+            tokens, _ = _tokens(t)
+            self.assertEqual(_kinds(tokens), [("part", raw, 1)], t)
+        # 第1部分 第一章 → part + 章（part 层级保留）
+        tokens, _ = _tokens("# 第1部分 第一章 引言\n")
+        self.assertEqual(_kinds(tokens), [
+            ("part", "第1部分", 1), ("chapter", "第一章", 1)])
+
+    def test_special_sections_recognized_not_numbered(self):
+        # 无编号特殊部分（前言/附录/后记/参考文献）识别，不参与连续性
+        for t in ["# 前言", "# 绪论", "# 附录", "# 后记", "# 参考文献",
+                  "# 引言", "# 结语"]:
+            tokens, _ = _tokens(t)
+            self.assertEqual(len(tokens), 1, t)
+            self.assertEqual(tokens[0].rule_id, "special", t)
+
+    def test_chapter_direct_cn_item_no_gap(self):
+        # # 第一章 直接 # 一、：同级 H1 标题，不报 hierarchy_gap
+        text = "# 第一章 引言\n# 一、研究背景\n# 二、研究意义\n"
+        result = check_text_with_rules(text, _RULES)
+        self.assertEqual(result.diagnostics, [])
+
+    def test_part_resets_chapter_continuity(self):
+        # 部内章节重新起号（第一部 第1-2章 → 第二部 第1章）→ 不误报 2→1
+        text = ("# 第一部 总则\n# 第一章 适用范围\n# 第二章 基本原则\n"
+                "# 第二部 分则\n# 第一章 细则\n")
+        result = check_text_with_rules(text, _RULES)
+        self.assertEqual(result.diagnostics, [])
+        # 独立章跳号仍报
+        result2 = check_text_with_rules("# 第一章\n# 第四章\n", _RULES)
+        self.assertIn("continuity_error",
+                      [d.kind for d in result2.diagnostics])
+
+    def test_part_prefix_merged_section_no_gap(self):
+        # 第一部 第1节：part + section 同层嵌套，不报 hierarchy_gap
+        text = "# 第一部 第1节 概述\n"
+        tokens, _ = _tokens(text)
+        self.assertEqual(_kinds(tokens), [
+            ("part", "第一部", 1), ("section", "第1节", 1)])
+        result = check_text_with_rules(text, _RULES)
+        self.assertEqual(result.diagnostics, [])
+        # 第一部 第一章 → part + 章（part 层级保留）
+        tokens, _ = _tokens("# 第一部 第一章 引言\n")
+        self.assertEqual(_kinds(tokens), [
+            ("part", "第一部", 1), ("chapter", "第一章", 1)])
+
+    def test_paren_cn_with_decor_prefix_recognized(self):
+        # 括号序号前有装饰前缀（- / 「」）也能识别
+        for t in ["# - （一）概念", "# 「（一）」概念", "# （一）概念"]:
+            tokens, _ = _tokens(t)
+            self.assertEqual(_kinds(tokens), [("paren_cn", "（一）", 1)], t)
+        # 括号装饰标题仍识别
+        tokens, _ = _tokens("# （第一章） 引言\n")
         self.assertEqual(_kinds(tokens), [("chapter", "第一章", 1)])
+
+    def test_halfwidth_paren_and_volume_no_prefix(self):
+        # 半角括号 (一)、无第前缀 卷一/卷X 识别
+        tokens, _ = _tokens("# (一) 概念\n")
+        self.assertEqual(_kinds(tokens), [("paren_cn", "(一)", 1)])
+        for t, raw, num in [("# 卷一", "卷一", 1), ("# 卷X", "卷X", 10),
+                            ("# 第一部", "第一部", 1)]:
+            tokens, _ = _tokens(t)
+            self.assertEqual(_kinds(tokens), [("part", raw, num)], t)
+
+    def test_part_absorbs_deeper_cross_line_sections(self):
+        # 卷→节（跨行，同为 H1）：节挂到卷下，不报 hierarchy_gap
+        text = ("# 第一卷 基础\n# 第1节 引言\n# 第2节 综述\n"
+                "# 第二卷 进阶\n# 第1节 方法\n")
+        result = check_text_with_rules(text, _RULES)
+        self.assertEqual(result.diagnostics, [])
+
+    def test_same_part_section_jump_checked(self):
+        # 同卷内节跳号（第1卷 第1节 / 第1卷 第3节）→ 报 1→3
+        text = "# 第1卷 第1节\n# 第1卷 第3节\n"
+        result = check_text_with_rules(text, _RULES)
+        self.assertIn("continuity_error",
+                      [d.kind for d in result.diagnostics])
+        # 连续 1→2 合法
+        text2 = "# 第1卷 第1节\n# 第1卷 第2节\n"
+        result2 = check_text_with_rules(text2, _RULES)
+        self.assertEqual(result2.diagnostics, [])
+
+    def test_merged_part_chapter_keeps_part_and_restart(self):
+        # 第一部 第一章 合并标题：part + 章都保留
+        tokens, _ = _tokens("# 第一部 第一章 总则\n")
+        self.assertEqual(_kinds(tokens), [
+            ("part", "第一部", 1), ("chapter", "第一章", 1)])
+        # 跨部章重启不误报
+        text = ("# 第一部 第一章\n# 第一部 第二章\n"
+                "# 第二部 第一章\n")
+        result = check_text_with_rules(text, _RULES)
+        self.assertEqual(result.diagnostics, [])
+
+    def test_appendix_with_number_suffix_recognized(self):
+        # 附录A / 附录一 识别为 special（词边界 + 编号后缀）
+        for t in ["# 附录A", "# 附录一", "# 附录1"]:
+            tokens, _ = _tokens(t)
+            self.assertEqual(_kinds(tokens), [("special", t[2:], None)], t)
+
+    def test_volume_no_prefix_with_chapter_keeps_chapter(self):
+        # 卷一 第一章：无第前缀 part + 章都保留，章跳号检出
+        tokens, _ = _tokens("# 卷一 第一章 总则\n")
+        self.assertEqual(_kinds(tokens), [
+            ("part", "卷一", 1), ("chapter", "第一章", 1)])
+        result = check_text_with_rules(
+            "# 卷一 第一章\n# 卷一 第三章\n", _RULES)
+        self.assertIn("continuity_error",
+                      [d.kind for d in result.diagnostics])
+
+    def test_plain_text_chapter_direct_cn_item_no_gap(self):
+        # 纯文本书稿 第一章 直接 一、/（一）（无 #）：柔性小节不报 gap
+        text = ("第一章 引言\n（一）背景\n（二）问题\n"
+                "第二章 方法\n一、样本\n二、指标\n")
+        result = check_text_with_rules(text, _RULES)
+        self.assertEqual(result.diagnostics, [])
+        # 序号跳号仍检出
+        text2 = "第一章 引言\n（一）背景\n（三）问题\n"
+        result2 = check_text_with_rules(text2, _RULES)
+        self.assertIn("continuity_error",
+                      [d.kind for d in result2.diagnostics])
+
+    def test_same_number_part_different_unit_not_merged(self):
+        # 第一部(部) 与 卷一(卷) 编号同为 1：不同单位不合并，不跨单位误报
+        text = ("# 第一部 第1节\n# 第二部 第1节\n"
+                "# 卷一 第3节\n")
+        result = check_text_with_rules(text, _RULES)
+        self.assertEqual(result.diagnostics, [])
+
+    def test_plain_text_ordered_headings_recognized(self):
+        # 无 # 纯文本书稿的（一）/一、/1、 标题识别，跳号检出
+        tokens, _ = _tokens("（一）研究背景\n")
+        self.assertEqual(_kinds(tokens), [("paren_cn", "（一）", 1)])
+        tokens, _ = _tokens("一、研究背景\n")
+        self.assertEqual(_kinds(tokens), [("cn_item", "一、", 1)])
+        tokens, _ = _tokens("1、方法\n")
+        self.assertEqual(_kinds(tokens), [("ar_punct", "1、", 1)])
+        # 列表项（1. 数字句点）仍不识别
+        tokens, _ = _tokens("1. 第一项\n")
+        self.assertEqual(tokens, [])
+        # 跳号检出
+        result = check_text_with_rules(
+            "（一）研究背景\n（三）研究意义\n", _RULES)
+        self.assertIn("continuity_error",
+                      [d.kind for d in result.diagnostics])
+
+    def test_special_word_boundary_not_overmatched(self):
+        # special 后界：完整词匹配，避免跋山涉水/结论性思考误报
+        for t in ["# 跋山涉水", "# 结论性思考", "# 参考文献格式规范",
+                  "# 注释方法"]:
+            tokens, _ = _tokens(t)
+            self.assertEqual(tokens, [], t)
+        # 完整特殊词仍识别
+        for t in ["# 参考文献", "# 结论", "# 附录"]:
+            tokens, _ = _tokens(t)
+            self.assertEqual(len(tokens), 1, t)
+            self.assertEqual(tokens[0].rule_id, "special", t)
 
     def test_h2_numbered_subsection_with_h3_child_is_legal(self):
         # 章 + ## 1.（H2）+ ### 2.（H3）：H2→H3 相邻 → 无诊断

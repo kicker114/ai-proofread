@@ -98,12 +98,14 @@ def normalize_number(groups: dict, order: list) -> Optional[int]:
             if val and val.isdigit():
                 return int(val)
         elif tag == "cn":
-            val = groups.get("num_cn") or groups.get("cn")
+            val = (groups.get("num_cn") or groups.get("cn")
+                   or groups.get("num_cn2"))  # num_cn2：卷一/第一部（无第前缀）
             n = chinese_numeral_to_int(val or "")
             if n is not None:
                 return n
         elif tag == "roman":
-            val = groups.get("num_rm") or groups.get("roman")
+            val = (groups.get("num_rm") or groups.get("roman")
+                   or groups.get("num_rm2"))  # num_rm2：卷X
             n = roman_to_int(val or "")
             if n is not None:
                 return n
