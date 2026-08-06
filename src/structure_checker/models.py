@@ -30,6 +30,10 @@ class Token:
     # 使「## 1. 概述」这类 H2 编号小节按作者意图作为"节"层级的二级标题，
     # 不再因 rule 是"目"(level3) 而误报 hierarchy_gap。
     heading_level: Optional[int] = None
+    # 标题行唯一标识：同一行内多个 token（如合并标题「第1章 第1节」的章+节）
+    # 共享同一 line_id，建树时视为"一个标题的多层编号"，按规则层级嵌套，
+    # 而不是把后出现的节当作独立根节点。
+    line_id: Optional[int] = None
 
 
 @dataclass
@@ -37,6 +41,9 @@ class Node:
     token: Token
     children: List["Node"] = field(default_factory=list)
     parent: Optional["Node"] = None
+    # 该 token 所在标题行的最大规则层级（用于判断"行含更深层编号"，
+    # 如合并标题「第1章 第1节」的章行含节 → 跨行同号时视同章多节展开）
+    line_max_level: int = 0
 
     @property
     def level(self) -> int:

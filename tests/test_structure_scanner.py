@@ -83,11 +83,15 @@ class ScannerUnitTests(unittest.TestCase):
         tokens, _ = _tokens(text)
         self.assertEqual(_kinds(tokens), [("chapter", "第一章", 1)])
 
-    def test_combined_chapter_heading_only_chapter_token(self):
-        # 标题正文含"第一节"不应额外产出 section token（锚定匹配）
-        text = "### 第一章 第一节 背景\n"
-        tokens, _ = _tokens(text)
-        self.assertEqual(_kinds(tokens), [("chapter", "第一章", 1)])
+    def test_combined_chapter_heading_extracts_both_numbers(self):
+        # 合并标题「第1章 第1节」/「第一章 第一节」：章+节编号都取（各层并列）
+        for text in ["### 第1章 第1节 背景", "### 第一章 第一节 背景"]:
+            tokens, _ = _tokens(text)
+            self.assertEqual(len(tokens), 2, text)
+            self.assertEqual(tokens[0].rule_id, "chapter", text)
+            self.assertEqual(tokens[1].rule_id, "section", text)
+            self.assertEqual(tokens[0].number_value, 1, text)
+            self.assertEqual(tokens[1].number_value, 1, text)
 
     def test_indented_heading_ignored_consistent_with_splitter(self):
         text = "  ## 第一节 背景\n# 第一章 引言\n"
@@ -193,6 +197,34 @@ class ScannerUnitTests(unittest.TestCase):
         tokens2, _ = _tokens(text2)
         self.assertEqual(tokens2, [])
 
+    def test_invalid_roman_rejected_as_missing_number(self):
+        # 非法罗马（IIX、VX、IIII）不再解析为真实章节编号
+        text = "# 第IIX章 附录\n# 第VX章 附录\n"
+        tokens, _ = _tokens(text)
+        for t in tokens:
+            self.assertEqual(t.rule_id, "chapter")
+            self.assertIsNone(t.number_value)
+        # 合法罗马仍解析（X=10、XII=12）
+        text2 = "# 第X章 附录\n# 第XII章 附录\n"
+        tokens2, _ = _tokens(text2)
+        nums = [t.number_value for t in tokens2 if t.rule_id == "chapter"]
+        self.assertEqual(nums, [10, 12])
+
+    def test_fullwidth_digits_and_period_normalized(self):
+        # 全角数字/句点（第１章、1．、１２．）归一化为 ASCII 后命中规则，
+        # token 偏移/raw_text 回退到原文
+        cases = {
+            "# 第１章 引言": [("chapter", "第１章", 1)],
+            "# 第１节 背景": [("section", "第１节", 1)],
+            "# 1．概述": [("subsection", "1．", 1)],
+            "### １２．细节": [("subsection", "１２．", 12)],
+        }
+        for text, expected in cases.items():
+            tokens, _ = _tokens(text)
+            self.assertEqual(_kinds(tokens), expected, text)
+            for t in tokens:
+                self.assertEqual(text[t.start:t.end], t.raw_text, text)
+
     def test_setext_heading_level_1_so_h2_numbered_subsection_is_legal(self):
         # setext 章（=== 作 H1）+ ## 1.（H2）编号节 → 无 level_mismatch
         # （回归：普通行先产出 heading_level=None 的章 token 曾使此处误报）
@@ -285,6 +317,169 @@ class ScannerIntegrationTests(unittest.TestCase):
         result = check_text_with_rules(text, _RULES)
         kinds = [d.kind for d in result.diagnostics]
         self.assertIn("continuity_error", kinds)
+
+    def test_merged_heading_same_line_nested_no_gap(self):
+        # 合并标题「第1章 第1节」/「第一章 第一节」：章+节同层嵌套，不误报
+        # hierarchy_gap（同一行内是"一个标题的多层编号"，不是层级跳变）
+        for text in ["# 第1章 第1节", "# 第一章 第一节",
+                     "# 第1章 第1节 第3目"]:
+            result = check_text_with_rules(text, _RULES)
+            self.assertEqual(result.diagnostics, [], text)
+
+    def test_merged_heading_tokens_share_line_id(self):
+        # 同一标题行的章+节 token 共享 line_id（供 builder 同层嵌套）
+        text = "# 第1章 第1节\n"
+        tokens, _ = _tokens(text)
+        chapter = next(t for t in tokens if t.rule_id == "chapter")
+        section = next(t for t in tokens if t.rule_id == "section")
+        self.assertIsNotNone(chapter.line_id)
+        self.assertEqual(chapter.line_id, section.line_id)
+
+    def test_traditional_jie_and_fullwidth_roman_normalized(self):
+        # 全角/繁體節（第１節）、全角罗马（第Ⅻ章/第Ｘ章）、Unicode 罗马、
+        # 小写 iv：归一化后命中，偏移映射回原文
+        cases = {
+            "# 第１節 背景": [("section", "第１節", 1)],
+            "# 第Ⅻ章 结束": [("chapter", "第Ⅻ章", 12)],
+            "# 第Ｘ章 附录": [("chapter", "第Ｘ章", 10)],
+            "# 第iv章": [("chapter", "第iv章", 4)],
+        }
+        for text, expected in cases.items():
+            tokens, _ = _tokens(text)
+            self.assertEqual(_kinds(tokens), expected, text)
+            for t in tokens:
+                self.assertEqual(text[t.start:t.end], t.raw_text, text)
+
+    def test_merged_heading_narratives_excluded(self):
+        # 叙述性提及（前有正文词 / 引号 / 空格）不产出第二个真实编号
+        cases = [
+            "# 第一章 第二章的比较",      # 空格+同层 → 排除
+            "# 第一章 参考文献「第2章」",   # 引号 → 排除
+            "# 第一章 与第二章的比较",     # 与 → 排除
+        ]
+        for text in cases:
+            tokens, _ = _tokens(text)
+            self.assertEqual(_kinds(tokens), [("chapter", "第一章", 1)], text)
+        # 起点非编号的叙述标题 → 无 token
+        tokens, _ = _tokens("### 罗杰斯《创新的扩散》第三章书评")
+        self.assertEqual(tokens, [])
+
+    def test_merged_heading_compact_and_pure_text(self):
+        # 无空格紧凑（第1章第1节）、纯文本行（第1章 第1节）、第字前缀
+        cases = {
+            "# 第1章第1节": [("chapter", "第1章", 1), ("section", "第1节", 1)],
+            "第1章 第1节": [("chapter", "第1章", 1), ("section", "第1节", 1)],
+            "# 第1章 第1.小节": [("chapter", "第1章", 1),
+                                 ("subsection", "1.", 1)],
+        }
+        for text, expected in cases.items():
+            tokens, _ = _tokens(text)
+            self.assertEqual(_kinds(tokens), expected, text)
+
+    def test_fullwidth_decimal_with_space_not_subsection(self):
+        # 全角小数带空格（１２． ５亿）不再被当目编号
+        for text in ["# １２． ５亿", "# 12. 5亿", "# １２．５ 亿元"]:
+            tokens, _ = _tokens(text)
+            self.assertEqual(tokens, [], text)
+        # 标题内真编号（12. 背景 / 1. 2024年的回顾）仍识别
+        tokens, _ = _tokens("# 12. 背景\n")
+        self.assertEqual(_kinds(tokens), [("subsection", "12.", 12)])
+        tokens, _ = _tokens("# 1. 2024年的回顾\n")
+        self.assertEqual(_kinds(tokens), [("subsection", "1.", 1)])
+
+    def test_merged_heading_cross_line_same_chapter_ok(self):
+        # 合并标题多行展开（第1章 第1节 / 第1章 第2节）→ 同章多节，不误报
+        text = "# 第1章 第1节\n# 第1章 第2节\n"
+        result = check_text_with_rules(text, _RULES)
+        self.assertEqual(result.diagnostics, [])
+        # 独立的真重复章（无更深层）仍报
+        text2 = "# 第1章\n# 第1章\n"
+        result2 = check_text_with_rules(text2, _RULES)
+        self.assertIn("continuity_error",
+                      [d.kind for d in result2.diagnostics])
+
+    def test_placeholder_roman_in_mixed_system_is_missing(self):
+        # 草稿占位「第X章」混排（第1章→第X章→第2章）：判占位 → number_missing，
+        # 而非连续性误报 1→10→2
+        text = "# 第1章\n# 第X章\n# 第2章\n"
+        result = check_text_with_rules(text, _RULES)
+        kinds = [d.kind for d in result.diagnostics]
+        self.assertIn("number_missing", kinds)
+        self.assertNotIn("continuity_error", kinds)
+
+    def test_section_roman_numbering_supported(self):
+        # 节级罗马（第IV节）正常嵌套，无诊断
+        text = "# 第一章\n## 第IV节\n"
+        result = check_text_with_rules(text, _RULES)
+        self.assertEqual(result.diagnostics, [])
+
+    def test_legit_single_letter_roman_not_placeholder(self):
+        # 第I章=1 是合法罗马，混合体系中不被误判为占位 number_missing
+        text = "# 第I章 前言\n# 第II章 绪论\n# 第1章 正文\n# 第2章 结论\n"
+        result = check_text_with_rules(text, _RULES)
+        # 罗马→阿拉伯体系切换：数值不可比，不报连续性
+        self.assertEqual(result.diagnostics, [])
+        # 仅 X 是占位
+        text2 = "# 第1章\n# 第X章\n# 第2章\n"
+        result2 = check_text_with_rules(text2, _RULES)
+        self.assertIn("number_missing", [d.kind for d in result2.diagnostics])
+
+    def test_cross_line_same_chapter_requires_both_with_sections(self):
+        # 独立章 + 带节行重复（第2章 / 第2章 第1节）→ 真实重复章，仍报
+        text = "# 第1章\n# 第2章\n# 第2章 第1节\n# 第3章\n"
+        result = check_text_with_rules(text, _RULES)
+        self.assertIn("continuity_error",
+                      [d.kind for d in result.diagnostics])
+
+    def test_cross_line_section_continuity_checked(self):
+        # 合并标题多行展开的节号连续性：1→3 跳节、1→1 重复都报
+        for text in ["# 第1章 第1节\n# 第1章 第3节\n",
+                     "# 第1章 第1节\n# 第1章 第1节\n"]:
+            result = check_text_with_rules(text, _RULES)
+            self.assertIn("continuity_error",
+                          [d.kind for d in result.diagnostics], text)
+        # 连续 1→2 合法
+        text2 = "# 第1章 第1节\n# 第1章 第2节\n"
+        result2 = check_text_with_rules(text2, _RULES)
+        self.assertEqual(result2.diagnostics, [])
+
+    def test_subsection_with_amount_title_not_dropped(self):
+        # 真编号小节标题以数量词开头（1. 2亿用户）不被误删
+        text = "# 1. 2亿用户\n# 2. 500万元投资\n"
+        tokens, _ = _tokens(text)
+        self.assertEqual(_kinds(tokens), [
+            ("subsection", "1.", 1), ("subsection", "2.", 2)])
+        # 纯数量小数（12. 5亿）仍排除，含繁体億
+        for t in ["# 12. 5亿", "# １２． ５億"]:
+            tokens, _ = _tokens(t)
+            self.assertEqual(tokens, [], t)
+
+    def test_plain_line_merged_section_requires_space_after(self):
+        # 普通行叙述「第一章 第三节内容是重点。」：第X节后紧跟正文 → 不合并
+        text = "第一章 第三节内容是重点。\n"
+        tokens, _ = _tokens(text)
+        self.assertEqual(_kinds(tokens), [("chapter", "第一章", 1)])
+        # 真合并仍取全
+        tokens, _ = _tokens("第1章 第1节\n")
+        self.assertEqual(_kinds(tokens), [
+            ("chapter", "第1章", 1), ("section", "第1节", 1)])
+
+    def test_ghost_section_narrative_excluded(self):
+        # 「第一章 第一节的比较」的"第一节"是叙述（编号后紧跟正文词），
+        # 不合并成幽灵节
+        text = "# 第一章 第一节的比较\n"
+        tokens, _ = _tokens(text)
+        self.assertEqual(_kinds(tokens), [("chapter", "第一章", 1)])
+        # 有空格的真合并保留
+        tokens, _ = _tokens("# 第一章 第一节 背景\n")
+        self.assertEqual(_kinds(tokens), [
+            ("chapter", "第一章", 1), ("section", "第一节", 1)])
+
+    def test_fullwidth_decor_prefix_normalized(self):
+        # 全角数字装饰前缀（第１部分 第一章）不再整行漏检
+        text = "# 第１部分 第一章 标题\n"
+        tokens, _ = _tokens(text)
+        self.assertEqual(_kinds(tokens), [("chapter", "第一章", 1)])
 
     def test_h2_numbered_subsection_with_h3_child_is_legal(self):
         # 章 + ## 1.（H2）+ ### 2.（H3）：H2→H3 相邻 → 无诊断

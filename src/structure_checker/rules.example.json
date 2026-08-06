@@ -22,9 +22,9 @@
       "enabled": true,
       "optional": false,
       "priority": 90,
-      "pattern": "(第(?P<num_cn>[一二三四五六七八九十百千零〇两壹贰叁肆伍陆柒捌玖拾]+)|第(?P<num_ar>[0-9]+))节",
+      "pattern": "(第(?P<num_cn>[一二三四五六七八九十百千零〇两壹贰叁肆伍陆柒捌玖拾]+)|第(?P<num_ar>[0-9]+)|第(?P<num_rm>[IVXLCDM]+))节",
       "numbering": {
-        "normalize": ["cn", "arabic"],
+        "normalize": ["cn", "arabic", "roman"],
         "continuity": "strict_increase"
       },
       "children": ["subsection"]

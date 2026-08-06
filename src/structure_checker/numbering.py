@@ -55,13 +55,30 @@ def chinese_numeral_to_int(text: str) -> Optional[int]:
 
 _ROMAN_VALUES = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
 
+# 合法罗马数字的严格判定（标准减法规则正则）。
+#   I/X/C/M 各自最多连续 3 次；V/L/D 不重复；减法对仅限 IX/IV/XL/XC/CD/CM，
+#   且不能出现「小值在大值之后又做减法」（IIX、VX、IC 等）。
+# 用途：把真正的非法序列（IIX、VX、IIII）与合法罗马章节号（X=10、XII=12、
+# MMXXIV=2024）区分开——非法序列不解析为真实章节编号。
+_ROMAN_RE = re.compile(
+    r"^M{0,3}(CM|CD|D?C{0,3})"
+    r"(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})$")
+
+
+def is_valid_roman(text: str) -> bool:
+    """text 是否为合法罗马数字（标准减法规则）。"""
+    if not text:
+        return False
+    text = text.upper()
+    return bool(_ROMAN_RE.fullmatch(text))
+
 
 def roman_to_int(text: str) -> Optional[int]:
     if not text:
         return None
     text = text.upper()
-    if not re.fullmatch(r"[IVXLCDM]+", text or ""):
-        return None
+    if not is_valid_roman(text):
+        return None  # 非法序列（IIX、VX、IIII）不算真实罗马
     total = 0
     prev = 0
     for ch in reversed(text):

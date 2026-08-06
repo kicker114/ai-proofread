@@ -23,7 +23,7 @@ _DECOR_PART = re.compile(
     r"^(?:[（(【［「『《〈〔｛<\"'“”‘’`]+"
     r"|[ \t　]+"
     r"|[-+*][ \t　]+"
-    r"|第[一二三四五六七八九十百千零〇0-9]+(?:部分|编|篇|卷|册)[ \t　]*)")
+    r"|第[一二三四五六七八九十百千零〇0-9０-９]+(?:部分|编|篇|卷|册)[ \t　]*)")
 
 
 def _strip_decorators(content: str, content_start: int) -> Tuple[str, int]:
@@ -36,12 +36,55 @@ def _strip_decorators(content: str, content_start: int) -> Tuple[str, int]:
     return content, content_start
 
 
+# 全角字符 → ASCII（用于标题内容归一化后再匹配规则，保持偏移不变）：
+#   全角数字 ０-９ → 0-9，全角句点 ．(U+FF0E) → .(U+002E)
+#   繁體「節」 → 节（港台/繁体书稿常见第X節）
+#   全角拉丁字母（第Ｘ章）与小写 ivxlcdm（第iv章）→ ASCII 大写
+_FULLWIDTH_TRANS = {
+    "０": "0", "１": "1", "２": "2", "３": "3", "４": "4",
+    "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
+    "．": ".",
+    "節": "节",
+    "Ｉ": "I", "Ｖ": "V", "Ｘ": "X", "Ｌ": "L", "Ｃ": "C",
+    "Ｄ": "D", "Ｍ": "M",
+    "i": "I", "v": "V", "x": "X", "l": "L", "c": "C", "d": "D", "m": "M",
+}
+# Unicode 罗马数字（U+2160-216B）→ ASCII 序列（多字符展开）
+_UNICODE_ROMAN = {
+    "Ⅰ": "I", "Ⅱ": "II", "Ⅲ": "III", "Ⅳ": "IV", "Ⅴ": "V",
+    "Ⅵ": "VI", "Ⅶ": "VII", "Ⅷ": "VIII", "Ⅸ": "IX", "Ⅹ": "X",
+    "Ⅺ": "XI", "Ⅻ": "XII",
+}
+
+
+def _normalize_for_match(content: str) -> Tuple[str, List[int]]:
+    """把标题内容的全角字符归一化为 ASCII，同时记录原文映射。
+
+    返回 (归一化后的 content, offset_map)，其中 offset_map[i] 是归一化串第
+    i 个字符在原文中的绝对偏移（原文 → 原样，全角 → 对应 ASCII 位置）。
+    这样 token 起点/终点可精确映射回原文，保持 report 高亮与偏移切片一致性。
+    Unicode 罗马数字（Ⅻ → XII）是 1→N 展开：norm 的每个字符都映射回同一个
+    原文偏移，token 偏移切片仍指向原文的 Ⅻ 位置。
+    """
+    out: List[str] = []
+    mapping: List[int] = []
+    for offset, ch in enumerate(content):
+        if ch in _UNICODE_ROMAN:
+            out.append(_UNICODE_ROMAN[ch])
+            mapping.extend([offset] * len(_UNICODE_ROMAN[ch]))
+        else:
+            out.append(_FULLWIDTH_TRANS.get(ch, ch))
+            mapping.append(offset)
+    return "".join(out), mapping
+
+
 def _match_rules(
         content: str, content_start: int,
         compiled: List[Tuple[Rule, "re.Pattern"]],
         require_space_after: bool,
         plain_only_prefix: bool,
-        heading_level: int | None = None) -> List[Token]:
+        heading_level: int | None = None,
+    line_id: int | None = None) -> List[Token]:
     """对标题内容做锚定匹配（re.match 于内容起点，规则间互斥）。
 
     require_space_after=True：编号后必须是空白/EOL 才接受（用于无 `#` 的
@@ -51,30 +94,112 @@ def _match_rules(
     heading_level：markdown ATX 标题的 `#` 数量（setext 为 1，普通行为 None）。
       有值时写入 Token，供 builder 建树时优先用它决定层级，避免规则层级
       （如"目"=3）与作者标题层级（H2）冲突导致的误报。
+    line_id：标题行唯一标识。同一行内多个 token（合并标题的章+节）共享，
+      供 builder 把同一行的多层编号按规则层级嵌套，而不是拆成独立根。
+
+    全角归一化：规则 pattern 的字符类仅 ASCII（`[0-9]+` / `[.]`），中文排版
+    常见的全角数字「第１章」「1．」会先归一化为 ASCII 再匹配；token 偏移映射
+    回原文，raw_text 用原文子串，report 高亮与偏移切片不受影响。
     """
     content, content_start = _strip_decorators(content, content_start)
+    norm, offmap = _normalize_for_match(content)
     out: List[Token] = []
-    for rule, pat in compiled:
-        if plain_only_prefix and not re.match(r"\(?第", rule.pattern):
-            continue
-        pm = pat.match(content)  # 锚定于（剥离装饰后的）内容起点
-        if pm is None:
-            continue
-        if require_space_after:
-            after = content[pm.end():]
-            if after and after[0] not in " \t　":
-                continue
-        num_val = normalize_number(pm.groupdict(), rule.numbering_normalize)
-        out.append(Token(
-            start=content_start + pm.start(),
-            end=content_start + pm.end(),
+
+    def _make_token(rule: Rule, m: "re.Match") -> Token | None:
+        num_val = normalize_number(m.groupdict(), rule.numbering_normalize)
+        start = content_start + offmap[m.start()]
+        end = content_start + offmap[m.end() - 1] + 1
+        return Token(
+            start=start,
+            end=end,
             rule_id=rule.id,
             level=rule.level,
             priority=rule.priority,
-            raw_text=pm.group(0),
+            raw_text=content[offmap[m.start()]:offmap[m.end() - 1] + 1],
             number_value=num_val,
             heading_level=heading_level,
-        ))
+            line_id=line_id,
+        )
+
+    # 目编号（N.）歧义检查：编号后（含空白后）若紧跟"数字+量词单位"且
+    # **单位之后无其他词**（12. 5亿 → "5亿"后即结束），是纯数量/小数；
+    # 若单位后还有名词（1. 2亿用户 → "2亿"后接"用户"），是真编号小节标题，
+    # 保留。规则正则的 (?=\D|$) 只挡「点后紧贴数字」。
+    _UNIT_AFTER_NUM = re.compile(r"^([0-9]+[亿萬億万元元％%])([^，。；;]*)")
+
+    def _is_subsection_decimal(rule: Rule, m: "re.Match") -> bool:
+        if rule.id != "subsection":
+            return False
+        rest = norm[m.end():].lstrip(" \t　")
+        um = _UNIT_AFTER_NUM.match(rest)
+        if not um:
+            return False
+        return not um.group(2).strip(" \t　")  # 单位后无其他词 → 纯数量/小数
+
+    # 起点匹配（保留 require_space_after 语义：普通行编号后须空白）
+    seed_norm_end = 0
+    for rule, pat in compiled:
+        if plain_only_prefix and not re.match(r"\(?第", rule.pattern):
+            continue
+        pm = pat.match(norm)
+        if pm is None:
+            continue
+        if require_space_after:
+            after = norm[pm.end():]
+            if after and after[0] not in " \t　":
+                continue
+        if _is_subsection_decimal(rule, pm):
+            continue
+        out.append(_make_token(rule, pm))
+        seed_norm_end = max(seed_norm_end, pm.end())
+
+    # 合并：标题行内后续编号（合并标题「第1章 第1节」「第一章 第一节」）。
+    # 只接受「规则层级严格递增 + 编号间仅空白/空」的连续编号——这是标题自身
+    # 层级结构的信号；叙述性提及（罗杰斯第三章书评 / 第二章的比较 /
+    # 参考文献「第2章」）不满足「层递」或「紧邻前一编号」，被排除。
+    if out:
+        last_end = seed_norm_end
+        max_level = max(t.level for t in out)
+        candidates = []
+        for rule, pat in compiled:
+            if plain_only_prefix and not re.match(r"\(?第", rule.pattern):
+                continue
+            for m in pat.finditer(norm, seed_norm_end):
+                candidates.append((m.start(), m.end(), rule, m))
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        for start, end, rule, m in candidates:
+            if start < last_end:
+                continue
+            # 编号间只能空白/空，或至多一个「第」字（「第1.小节」的 1. 前缀）。
+            # 叙述性提及（第二章的比较 / 参考文献「第2章」）含正文词 → 排除；
+            # 同层重复（第二章 第二章）被下面的 level 递增挡住。
+            if norm[last_end:start].strip(" \t　") not in ("", "第"):
+                continue
+            if rule.level <= max_level:
+                continue  # 层级必须严格递增（章→节→目）
+            if _is_subsection_decimal(rule, m):
+                continue
+            # 编号后检查（防幽灵节 / 防普通行叙述行）。只对「第X章/第X节」
+            # 生效：它们后紧跟无空白的正文词（第一章 第一节的比较）是叙述；
+            # 「N.」目编号后紧跟正文词（第1.小节 / 1. 2亿用户）是正常标题，
+            # 不检查。
+            if rule.id in ("chapter", "section"):
+                if require_space_after:
+                    # 普通文本行：合并编号后也须空白（与起点一致），
+                    # 「第1章 第1节内容见第三章」的第1节是叙述 → 排除
+                    after = norm[end:]
+                    if after and after[0] not in " \t　":
+                        continue
+                else:
+                    # ATX 标题：合并编号后若紧跟正文词（非空白、非"第"、
+                    # 非数字），是叙述性提及（第一章 第一节的比较）→ 排除
+                    after = norm[end:]
+                    if (after and after[0] not in " \t　"
+                            and not after.startswith("第") and not after[0].isdigit()):
+                        continue
+            out.append(_make_token(rule, m))
+            last_end = end
+            max_level = rule.level
     return out
 
 
@@ -136,18 +261,18 @@ def scan_text(text: str, rules: List[Rule]) -> Tuple[List[Token], List[Diagnosti
         if am is not None:
             content = am.group("content")
             content_start = line_start + am.start("content")
-            hashes = len(am.group("hashes"))  # markdown 标题层级（# 数量）
+            hashes = len(am.group("hashes").replace(" ", ""))  # 标题层级 = # 数量
             tokens.extend(_match_rules(
                 content, content_start, compiled,
                 require_space_after=False, plain_only_prefix=False,
-                heading_level=hashes))
+                heading_level=hashes, line_id=line_start))
         elif idx in setext_lines:
             # setext 标题文本行：作为 H1 参与建树
             indent = len(body) - len(body.lstrip(" \t"))
             tokens.extend(_match_rules(
                 body.strip(), line_start + indent, compiled,
                 require_space_after=False, plain_only_prefix=False,
-                heading_level=1))
+                heading_level=1, line_id=line_start))
         elif _SETEXT_RE.match(body):
             pass  # === 下划线行本身，其标题文本行已在上一行处理
         else:
@@ -155,7 +280,7 @@ def scan_text(text: str, rules: List[Rule]) -> Tuple[List[Token], List[Diagnosti
             tokens.extend(_match_rules(
                 body, line_start, compiled,
                 require_space_after=True, plain_only_prefix=True,
-                heading_level=None))
+                heading_level=None, line_id=line_start))
 
         line_start += len(line)
 
