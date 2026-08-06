@@ -123,7 +123,7 @@ proofread extract 书稿.pdf --out 书稿_review_source.json
 |------|------|------|------|
 | **0a** | 汉字规范 | TGSCC 查表 | 繁体/异体/表外字，确定性 |
 | **0b** | 异形词/词形 | 离线词典扫描 | 不规范词形→规范词形 |
-| **0c** | 结构检查 | structure_checker | 章节层级 + 编号连续性 |
+| **0c** | 结构检查 | structure_checker | 6 类标题体系层级 + 编号连续性 |
 | **1** | LLM 审校 | DeepSeek JSON 发现模式 | 分块异步并发，只改有问题的句子 |
 | **2** | 专名查词（`--names`） | LLM 识别 + MDict 词典 | 人名/地名/机构名核验 |
 | **3** | 句子对齐 | 锚点算法 | 原文 vs 精修版逐句对比 |
@@ -322,7 +322,7 @@ pipeline 的 legacy `max_results.json` 可能没有源 PDF 哈希，因此 PDF d
 | HTML 对齐报告 | `src/html_report_v2.py` | 句子级勘误表渲染 |
 | TGSCC 汉字 | `src/special_checker/tgscc.py` | 通用规范汉字表检查 |
 | 模糊匹配 | `src/special_checker/match_similar_text.py` | LLM 修正回写定位 |
-| 结构检查 | `src/structure_checker/` | 层级 + 编号连续性（已补 hierarchy_gap） |
+| 结构检查 | `src/structure_checker/` | 6 类标题体系（章/节/目、部编卷、中文序号、括号序号、数字顿号、多级数字、特殊部分）+ 编号连续性 |
 | 词典查询 | `src/special_checker/mdict.py` | MDict 查询，`query_mdx(mdx, word)` |
 | 词级 diff | `src/diff_tools.py` | HTML 词级差异（已修转义） |
 
@@ -337,13 +337,21 @@ python3 -m unittest \
   tests.test_pdf_pipeline \
   tests.test_word_writeback \
   tests.test_altchunk \
-  tests.test_splitter_context
+  tests.test_splitter_context \
+  tests.test_network_resume \
+  tests.test_skip_visibility \
+  tests.test_book_path \
+  tests.test_structure_scanner
+
+# 确定性阶段回归（无需 API，秒级）：samples/审校合成稿.md 固定样本
+python3 samples/validate_synthetic.py
 ```
 
 测试覆盖 Codex Skill、DOCX 表格提取、findings 哈希门禁、Word OOXML 修订批注、
 PDF quads/歧义/降级策略、**altChunk（MHT 嵌入）DOCX 全管线**、**分块 context
-裁剪**以及输入文件防覆盖。旧的 `test_performance.py` 和 `test_two_stage.py` 仍
-引用已移除的 `src.sentence_aligner_simple`，不属于当前回归门。
+裁剪**、**网络重试/checkpoint 续跑**、**跳过发现可见性**、**book 路径可靠性**、
+**结构检查器 6 类标题体系**以及输入文件防覆盖。旧的 `test_performance.py` 和
+`test_two_stage.py` 仍引用已移除的 `src.sentence_aligner_simple`，不属于当前回归门。
 
 ---
 

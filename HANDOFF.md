@@ -254,13 +254,20 @@ python3 -m unittest \
 - 2026-08-06 新增：`src/html_report_v3.py`（V3 报告）、`src/extract_source.py` altChunk
   解析器/物化器/共享判定、`src/splitter.py` context 裁剪 + 无空行硬切、
   `src/proofreader.py` `max_tokens`。
-- Tests：四个 `tests/test_*` Codex/Word/PDF 回归文件 + `tests/test_altchunk.py` +
-  `tests/test_splitter_context.py`。
+- 结构检查器：`src/structure_checker/`（scanner 两遍匹配 + 全角归一化 + 6 类标题
+  体系；builder 建树以 heading_level 优先 + part 边界/吸收 + 同号合并；numbering
+  严格罗马/中文序号归一化；rules.example.json 6 类规则 + 节罗马）、
+  `src/max_pipeline.py` 结构阶段消费。
+- Tests：`tests/test_altchunk.py`、`tests/test_splitter_context.py`、
+  `tests/test_network_resume.py`、`tests/test_skip_visibility.py`、
+  `tests/test_book_path.py`、`tests/test_structure_scanner.py`（68 例）。
+- Samples：`samples/审校合成稿.md` + `_错误清单.md` + `validate_synthetic.py`。
 - Docs：`README.md`、`CLAUDE.md`、`HANDOFF.md`、`.workbuddy/agents/pdf-proofreader.md`。
+- 产物：`审校项目标准作业指令示范.docx`（SOP 示范）。
 
 ## Next Safe Action
 
-1. 先运行上面的 57 项专项回归。
+1. 先运行上面的专项回归（`tests/` 下 `test_*`，当前 141 项）。
 2. 检查 `git diff --check` 和 `git status --short`。
 3. 提交时保留用户原有 `.workbuddy/memory/2026-08-05.md` 修改，不回退，也不要误称为本次实现。
 4. 对新的真实稿件始终先生成审校源/哈希；PDF 必须先 dry-run。

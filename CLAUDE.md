@@ -145,7 +145,8 @@ python3 -m unittest \
   tests.test_splitter_context \
   tests.test_network_resume \
   tests.test_skip_visibility \
-  tests.test_book_path
+  tests.test_book_path \
+  tests.test_structure_scanner
 
 # 确定性阶段回归（无需 API，秒级）：samples/审校合成稿.md 固定样本
 python3 samples/validate_synthetic.py
