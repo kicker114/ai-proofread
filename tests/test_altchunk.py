@@ -20,6 +20,8 @@ from lxml import etree
 from src.cli import _docx_to_md
 from src.extract_source import (
     W_NS,
+    _decode_mht_html,
+    docx_uses_altchunk_body,
     extract_altchunk_paragraphs,
     extract_docx_units,
     materialize_altchunk_paragraphs,
@@ -187,6 +189,110 @@ class AltChunkExtractTests(unittest.TestCase):
         self.assertIn(">旋<", doc_xml)
         # 原文"漩涡"不再是连续文本
         self.assertNotIn(">漩涡<", doc_xml)
+
+
+class AltChunkHardeningTests(unittest.TestCase):
+    """对抗性审查发现的边界情况回归。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _make_docx_with_body(self, body_xml: str, mht: str = _MHT) -> Path:
+        """构造自定义 body 的 altChunk docx。"""
+        path = self.root / "custom.docx"
+        ct = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="{CT_NS}">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+  <Override PartName="/word/afchunk.mht" ContentType="message/rfc822"/>
+</Types>"""
+        rels = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="{REL_NS}">
+  <Relationship Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"
+    Target="/word/document.xml" Id="rId1"/>
+</Relationships>"""
+        doc_rels = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="{REL_NS}">
+  <Relationship Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/aFChunk"
+    Target="/word/afchunk.mht" Id="htmlChunk"/>
+</Relationships>"""
+        document = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="{W_NS}" xmlns:r="{R_NS}">
+  <w:body>{body_xml}<w:sectPr/></w:body>
+</w:document>"""
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("[Content_Types].xml", ct)
+            z.writestr("_rels/.rels", rels)
+            z.writestr("word/_rels/document.xml.rels", doc_rels)
+            z.writestr("word/document.xml", document)
+            z.writestr("word/afchunk.mht", mht)
+        return path
+
+    def test_empty_w_p_plus_altchunk_uses_shared_predicate(self):
+        """空 <w:p/> 占位 + altChunk：extract 与 P-map 必须一致（不因空段退路）。"""
+        path = self._make_docx_with_body('<w:p/>' + '<w:altChunk r:id="htmlChunk"/>')
+        units = extract_docx_units(str(path))
+        text_map = _build_para_text_map(str(path))
+        self.assertEqual(len(units), 5)
+        self.assertEqual(len(text_map), 5)
+        for i in range(5):
+            self.assertEqual(units[i]["text"], text_map[i], f"P{i} 不一致")
+        # 共享判定应识别为 altChunk 文档
+        with zipfile.ZipFile(path) as z:
+            self.assertTrue(docx_uses_altchunk_body(z))
+
+    def test_mixed_doc_falls_back_to_native_walk(self):
+        """混合文档（真实 w:p + altChunk）：三消费方一致走标准 walk，altChunk 不物化。"""
+        path = self._make_docx_with_body(
+            '<w:p><w:r><w:t>原生段落甲</w:t></w:r></w:p>'
+            '<w:altChunk r:id="htmlChunk"/>')
+        units = extract_docx_units(str(path))
+        text_map = _build_para_text_map(str(path))
+        self.assertEqual([u["text"] for u in units], ["原生段落甲"])
+        self.assertEqual(list(text_map.values()), ["原生段落甲"])
+        with zipfile.ZipFile(path) as z:
+            self.assertFalse(docx_uses_altchunk_body(z))  # 有真实文本 → 非 altChunk 文档
+
+    def test_decode_base64_and_gbk(self):
+        import base64
+        html_body = '<p>这是base64编码内容</p>'
+        b64 = base64.b64encode(html_body.encode("utf-8")).decode()
+        mht_b64 = (f'MIME-Version: 1.0\nContent-Type: text/html; charset="utf-8"\n'
+                   f'Content-Transfer-Encoding: base64\n\n{b64}\n')
+        self.assertIn("base64编码", _decode_mht_html(mht_b64.encode("latin-1")))
+
+        mht_gbk = ('Content-Type: text/html; charset="gbk"\n'
+                   'Content-Transfer-Encoding: quoted-printable\n\n'
+                   '<p>=D6=D0=CE=C4</p>\n')
+        self.assertIn("中文", _decode_mht_html(mht_gbk.encode("latin-1")))
+
+    def test_top_level_import_builds_text_map(self):
+        """max_pipeline 顶层 import（脚本模式）也能建 P-map。"""
+        import importlib
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+        try:
+            mp = importlib.import_module("max_pipeline")
+            importlib.reload(mp)
+            tm = mp._build_para_text_map(str(self._make_docx_with_body(
+                '<w:altChunk r:id="htmlChunk"/>')))
+            self.assertEqual(len(tm), 5)
+        finally:
+            sys.path.pop(0)
+
+    def test_docx_without_rels_part_does_not_crash(self):
+        """纯 Word docx 缺 word/_rels/document.xml.rels 不崩溃（BUG 修复）。"""
+        path = self.root / "norels.docx"
+        document = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="{W_NS}"><w:body><w:p><w:r><w:t>正常段落</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"""
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("word/document.xml", document)
+        units = extract_docx_units(str(path))
+        self.assertEqual([u["text"] for u in units], ["正常段落"])
 
 
 if __name__ == "__main__":

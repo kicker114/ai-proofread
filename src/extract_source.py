@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import os
 import re
@@ -47,7 +48,10 @@ def _read_altchunk_targets(archive: zipfile.ZipFile) -> list[bytes]:
     """
     from lxml import etree
 
-    rels_xml = archive.read("word/_rels/document.xml.rels")
+    try:
+        rels_xml = archive.read("word/_rels/document.xml.rels")
+    except KeyError:
+        return []
     REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
     rel_root = etree.fromstring(rels_xml)
     rmap: dict[str, str] = {}
@@ -80,13 +84,13 @@ def _read_altchunk_targets(archive: zipfile.ZipFile) -> list[bytes]:
 
 
 def _decode_mht_html(raw: bytes) -> str:
-    """把 altChunk 内嵌文件（MIME multipart MHT / quoted-printable HTML）解码成 HTML 字符串。
+    """把 altChunk 内嵌文件（MIME multipart MHT / HTML）解码成 HTML 字符串。
 
     步骤（严格按字节流处理，避免提前 UTF-8 解码损坏）：
       1. latin-1 解码（1:1 字节映射）便于字符串操作；
       2. 按 multipart 实际分隔线（"--"+声明 boundary）切分，取含 text/html 的段；
       3. 以第一个 "<" 标签作为正文起点（MIME 头与分隔线不含 "<"）；
-      4. quoted-printable 解码 → UTF-8。
+      4. 按 Content-Transfer-Encoding 解码（quoted-printable / base64）→ UTF-8。
 
     兼容纯 HTML（无 MIME 头）直接返回。
     """
@@ -96,6 +100,16 @@ def _decode_mht_html(raw: bytes) -> str:
         return raw.decode("utf-8", errors="replace")
 
     body = text
+    transfer_encoding = "quoted-printable"  # 默认
+    charset = "utf-8"
+    cm = re.search(r'Content-Type:\s*text/html[^;]*;\s*charset="?([^"\s;\r\n]+)"?',
+                   text, re.IGNORECASE)
+    if cm:
+        charset = cm.group(1).strip().strip('"')
+    em = re.search(r'Content-Transfer-Encoding:\s*([a-zA-Z0-9-]+)', text, re.IGNORECASE)
+    if em:
+        transfer_encoding = em.group(1).lower()
+
     bm = re.search(r'boundary="?([^"\r\n]+)"?', text, re.IGNORECASE)
     if bm:
         delim = "--" + bm.group(1).strip('"')
@@ -103,26 +117,43 @@ def _decode_mht_html(raw: bytes) -> str:
             # 真正的 HTML 段有 Content-Type: text/html 段头（顶层头只写 type="text/html"）
             if re.search(r'Content-Type:\s*text/html', part, re.IGNORECASE):
                 body = part
+                # 段内可能覆写 charset / transfer-encoding
+                c2 = re.search(
+                    r'Content-Type:\s*text/html[^;]*;\s*charset="?([^"\s;\r\n]+)"?',
+                    part, re.IGNORECASE)
+                if c2:
+                    charset = c2.group(1).strip().strip('"')
+                e2 = re.search(
+                    r'Content-Transfer-Encoding:\s*([a-zA-Z0-9-]+)', part, re.IGNORECASE)
+                if e2:
+                    transfer_encoding = e2.group(1).lower()
                 break
 
-    tag_pos = body.find("<")
-    if tag_pos >= 0:
-        body = body[tag_pos:]
-    else:
-        idx = body.find("\n\n")
-        if idx >= 0:
-            body = body[idx + 2:]
+    # 先用空行切出 MIME payload（base64 的 payload 无 "<"，此步必须先做）
+    header_split = body.find("\n\n")
+    if header_split >= 0:
+        body = body[header_split + 2:]
 
-    import quopri
     try:
-        body = quopri.decodestring(
-            body.encode("latin-1")).decode("utf-8", errors="replace")
+        raw_bytes = body.encode("latin-1")
+        if transfer_encoding == "base64":
+            import base64
+            raw_bytes = base64.b64decode(re.sub(r"\s+", "", body))
+        elif transfer_encoding in ("quoted-printable", "qp"):
+            import quopri
+            raw_bytes = quopri.decodestring(raw_bytes)
+        # 按声明的 charset 解码（GBK/GB2312/Big5/UTF-8）
+        try:
+            return raw_bytes.decode(charset, errors="replace")
+        except LookupError:
+            return raw_bytes.decode("utf-8", errors="replace")
     except Exception:
-        pass
-    return body
+        # 回退：取第一个 "<" 之后的原始文本
+        tag_pos = body.find("<")
+        return body[tag_pos:] if tag_pos >= 0 else body
 
 
-def _html_to_paragraphs(html: str) -> list[dict[str, Any]]:
+def _html_to_paragraphs(html_text: str) -> list[dict[str, Any]]:
     """把 HTML 正文解析为有序段落 [{text, heading_level}]。
 
     标题 h1-h6 → heading_level 1-6（供 Markdown `#` 前缀）；<p>/<div>/<br>
@@ -132,7 +163,7 @@ def _html_to_paragraphs(html: str) -> list[dict[str, Any]]:
     # 按标题与块级元素切开
     pieces = re.split(
         r"(<h[1-6][^>]*>.*?</h[1-6]>)",
-        html, flags=re.DOTALL | re.IGNORECASE)
+        html_text, flags=re.DOTALL | re.IGNORECASE)
     for piece in pieces:
         m = re.match(r"<h([1-6])[^>]*>(.*?)</h\1>", piece,
                      flags=re.DOTALL | re.IGNORECASE)
@@ -144,7 +175,9 @@ def _html_to_paragraphs(html: str) -> list[dict[str, Any]]:
             body = piece
 
         if level is None:
-            # 块级分界 → 段落
+            # 块级分界 → 段落（含未闭合的 <p>/<div> 开标签，增强容错）
+            body = re.sub(r"<p[^>]*>", "\n", body, flags=re.IGNORECASE)
+            body = re.sub(r"<div[^>]*>", "\n", body, flags=re.IGNORECASE)
             body = re.sub(r"<br\s*/?>", "\n", body, flags=re.IGNORECASE)
             body = re.sub(r"</p>", "\n", body, flags=re.IGNORECASE)
             body = re.sub(r"</div>", "\n", body, flags=re.IGNORECASE)
@@ -154,10 +187,8 @@ def _html_to_paragraphs(html: str) -> list[dict[str, Any]]:
         body = re.sub(r"<style[^>]*>.*?</style>", "", body,
                       flags=re.DOTALL | re.IGNORECASE)
         body = re.sub(r"<[^>]+>", "", body)
-        body = body.replace("&nbsp;", " ").replace("&amp;", "&")
-        body = body.replace("&lt;", "<").replace("&gt;", ">")
-        body = body.replace("&quot;", '"').replace("&#39;", "'")
-        body = body.replace("​", "")
+        body = html.unescape(body)  # 完整 HTML 实体解码
+        body = body.replace("&nbsp;", " ").replace("​", "")
 
         for para in body.split("\n"):
             text = " ".join(para.split())
@@ -185,6 +216,41 @@ def extract_altchunk_paragraphs(archive: zipfile.ZipFile) -> list[dict[str, Any]
         html_text = _decode_mht_html(raw)
         paragraphs.extend(_html_to_paragraphs(html_text))
     return paragraphs
+
+
+def docx_uses_altchunk_body(archive: zipfile.ZipFile) -> bool:
+    """判定 docx 正文是否完全由 altChunk（内嵌 MHT/HTML）承载。
+
+    判定规则（三处消费方共用，保证 P 编号一致）：
+      - body 存在至少一个 <w:altChunk>，且
+      - 没有**有文本承载**的 w:p 或 w:tbl 段落（空段落 <w:p/> 不算数）。
+
+    这样：
+      - 纯 altChunk 文档（含带空占位 <w:p/> 的）→ True，走 altChunk 分支；
+      - 混合文档（altChunk + 真实文本段落）→ False，三消费方一致走标准 walk；
+      - 纯 Word 文档（无 altChunk）→ False，不受影响。
+    """
+    from lxml import etree
+
+    doc_xml = archive.read("word/document.xml")
+    root = etree.fromstring(doc_xml)
+    body = root.find(f"{W}body")
+    if body is None:
+        return False
+
+    has_altchunk = False
+    for child in body.iterchildren():
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag == "altChunk":
+            has_altchunk = True
+        elif tag == "p":
+            if _accepted_paragraph_text(child).strip():
+                return False  # 有真实文本段落
+        elif tag == "tbl":
+            for row_p in child.findall(f".//{W}p"):
+                if _accepted_paragraph_text(row_p).strip():
+                    return False  # 有真实表格文本
+    return has_altchunk
 
 
 def materialize_altchunk_paragraphs(body: Any, paragraphs: list[dict[str, Any]]) -> int:
@@ -295,21 +361,21 @@ def extract_docx_units(path: str | Path) -> list[dict[str, Any]]:
         body = root.find(f"{W}body")
         if body is None:
             return []
-        # 纯 altChunk 文档（无 w:p）→ 用共享解析器，保留 heading_level 供 MD 标题
-        altchunk_paras = extract_altchunk_paragraphs(archive)
-        if altchunk_paras and not any(
-                child.tag.rsplit("}", 1)[-1] == "p"
-                for child in body.iterchildren()):
-            return [
-                {
-                    "location": f"P{index}",
-                    "kind": "paragraph",
-                    "text": para["text"],
-                    **({"heading_level": para["heading_level"]}
-                       if para.get("heading_level") else {}),
-                }
-                for index, para in enumerate(altchunk_paras)
-            ]
+        # 纯 altChunk 文档（正文完全由内嵌 MHT 承载）→ 共享解析器，
+        # 保留 heading_level 供 MD 标题。P 编号与引擎物化后一致。
+        if docx_uses_altchunk_body(archive):
+            altchunk_paras = extract_altchunk_paragraphs(archive)
+            if altchunk_paras:
+                return [
+                    {
+                        "location": f"P{index}",
+                        "kind": "paragraph",
+                        "text": para["text"],
+                        **({"heading_level": para["heading_level"]}
+                           if para.get("heading_level") else {}),
+                    }
+                    for index, para in enumerate(altchunk_paras)
+                ]
 
     units: list[dict[str, Any]] = []
     for index, (paragraph, kind) in enumerate(_body_paragraphs(body)):

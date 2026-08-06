@@ -134,20 +134,22 @@ def _build_para_text_map(docx_path: str) -> Dict[int, str]:
     from lxml import etree
 
     with zipfile.ZipFile(docx_path, "r") as z:
-        doc_xml = etree.fromstring(z.read("word/document.xml"))
-        body = doc_xml.find(f"{{{_W_NS}}}body")
-        # 纯 altChunk 文档（无 w:p）→ 直接从共享解析器建 text_map，
-        # P 编号与引擎物化后的 build_para_map 逐段一致
-        from .extract_source import extract_altchunk_paragraphs
-        has_wp = any(
-            child.tag.rsplit("}", 1)[-1] in ("p", "tbl")
-            for child in body.iterchildren()) if body is not None else False
-        if body is not None and not has_wp:
+        # 纯 altChunk 文档（正文完全由 MHT 承载）→ 共享解析器建 text_map，
+        # P 编号与引擎物化后的 build_para_map 逐段一致。
+        # 兼容两种运行方式：作为模块（相对导入）或作为脚本（顶层绝对导入）。
+        try:
+            from .extract_source import docx_uses_altchunk_body, extract_altchunk_paragraphs
+        except ImportError:
+            from extract_source import docx_uses_altchunk_body, extract_altchunk_paragraphs
+        if docx_uses_altchunk_body(z):
             altchunk_paras = extract_altchunk_paragraphs(z)
             if altchunk_paras:
                 return {pn: para["text"] for pn, para in enumerate(altchunk_paras)}
 
+        doc_xml = etree.fromstring(z.read("word/document.xml"))
+
     text_map: Dict[int, str] = {}
+    body = doc_xml.find(f"{{{_W_NS}}}body")
     pn = 0
     if body is None:
         return text_map

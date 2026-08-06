@@ -1022,9 +1022,13 @@ def main():
     print(f'Doc: {docx_path} → {len(para_map)} paragraphs')
 
     # ── Handle altChunk (embedded MHT/HTML) ──
-    # 有 altChunk 就转换（纯 altChunk 文档 para_map 为空；混合文档补全正文）
-    ac = body.findall(qn('altChunk'))
-    if ac:
+    # 仅当正文完全由 altChunk 承载时物化（与 extract/max 共享同一判定）。
+    # 混合文档（altChunk + 真实 w:p）一律走标准 walk，避免正文重排。
+    try:
+        from .extract_source import docx_uses_altchunk_body
+    except ImportError:
+        from extract_source import docx_uses_altchunk_body
+    if docx_uses_altchunk_body(z):
         print('WARN: 文档为 altChunk 格式，正在转换为标准 w:p 段落...')
         _convert_altchunk_to_paras(z, docx_path, doc_xml, body)
         para_map, text_map = build_para_map(body)
