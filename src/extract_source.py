@@ -26,6 +26,196 @@ def sha256_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+# ── altChunk (内嵌 MHT/HTML) 支持 ────────────────────────────────────────
+#
+# PDF→Word 转换工具 / 在线协作编辑器（腾讯文档等）会把正文以 <w:altChunk>
+# 形式嵌入，而不是标准 w:p 段落。整个管线（DOCX→MD、P 编号映射、02 引擎
+# 回写）都必须从同一份 altChunk 段落列表取数，P 编号才能严格对齐。
+# 注意：extract_source / max_pipeline / writeback_engine 三处的段落 walk 逻辑
+# 是刻意重复的（见 CLAUDE.md P-numbering consistency），这里只共享 MHT 的
+# *解析* 与 *段落物化*，不合并任何 walk 逻辑。
+
+
+R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+
+def _read_altchunk_targets(archive: zipfile.ZipFile) -> list[bytes]:
+    """从打开的 docx 里读取全部 <w:altChunk> 引用的内嵌文件原始字节。
+
+    Returns:
+        按 altChunk 在 body 中出现的顺序，返回各目标文件（.mht/.html）字节。
+    """
+    from lxml import etree
+
+    rels_xml = archive.read("word/_rels/document.xml.rels")
+    REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+    rel_root = etree.fromstring(rels_xml)
+    rmap: dict[str, str] = {}
+    for rel in rel_root.findall(f"{{{REL_NS}}}Relationship"):
+        rid = rel.get("Id")
+        tgt = rel.get("Target")
+        if rid and tgt:
+            rmap[rid] = tgt
+
+    doc_xml = archive.read("word/document.xml")
+    doc_root = etree.fromstring(doc_xml)
+    out: list[bytes] = []
+    for element in doc_root.iter():
+        if element.tag.rsplit("}", 1)[-1] != "altChunk":
+            continue
+        rid = element.get(f"{{{R_NS}}}id")
+        if not rid:
+            continue
+        target = rmap.get(rid, "")
+        if not target:
+            continue
+        name = target.lstrip("/")
+        if not name.startswith("word/"):
+            name = f"word/{name}"
+        try:
+            out.append(archive.read(name))
+        except KeyError:
+            continue
+    return out
+
+
+def _decode_mht_html(raw: bytes) -> str:
+    """把 altChunk 内嵌文件（MIME multipart MHT / quoted-printable HTML）解码成 HTML 字符串。
+
+    步骤（严格按字节流处理，避免提前 UTF-8 解码损坏）：
+      1. latin-1 解码（1:1 字节映射）便于字符串操作；
+      2. 按 multipart 实际分隔线（"--"+声明 boundary）切分，取含 text/html 的段；
+      3. 以第一个 "<" 标签作为正文起点（MIME 头与分隔线不含 "<"）；
+      4. quoted-printable 解码 → UTF-8。
+
+    兼容纯 HTML（无 MIME 头）直接返回。
+    """
+    text = raw.decode("latin-1")
+    low = text.lower()
+    if "content-type:" not in low and "content-transfer-encoding:" not in low:
+        return raw.decode("utf-8", errors="replace")
+
+    body = text
+    bm = re.search(r'boundary="?([^"\r\n]+)"?', text, re.IGNORECASE)
+    if bm:
+        delim = "--" + bm.group(1).strip('"')
+        for part in text.split(delim):
+            # 真正的 HTML 段有 Content-Type: text/html 段头（顶层头只写 type="text/html"）
+            if re.search(r'Content-Type:\s*text/html', part, re.IGNORECASE):
+                body = part
+                break
+
+    tag_pos = body.find("<")
+    if tag_pos >= 0:
+        body = body[tag_pos:]
+    else:
+        idx = body.find("\n\n")
+        if idx >= 0:
+            body = body[idx + 2:]
+
+    import quopri
+    try:
+        body = quopri.decodestring(
+            body.encode("latin-1")).decode("utf-8", errors="replace")
+    except Exception:
+        pass
+    return body
+
+
+def _html_to_paragraphs(html: str) -> list[dict[str, Any]]:
+    """把 HTML 正文解析为有序段落 [{text, heading_level}]。
+
+    标题 h1-h6 → heading_level 1-6（供 Markdown `#` 前缀）；<p>/<div>/<br>
+    作为段落分界。跳过纯空段落。
+    """
+    lines: list[dict[str, Any]] = []
+    # 按标题与块级元素切开
+    pieces = re.split(
+        r"(<h[1-6][^>]*>.*?</h[1-6]>)",
+        html, flags=re.DOTALL | re.IGNORECASE)
+    for piece in pieces:
+        m = re.match(r"<h([1-6])[^>]*>(.*?)</h\1>", piece,
+                     flags=re.DOTALL | re.IGNORECASE)
+        if m:
+            level = int(m.group(1))
+            body = m.group(2)
+        else:
+            level = None
+            body = piece
+
+        if level is None:
+            # 块级分界 → 段落
+            body = re.sub(r"<br\s*/?>", "\n", body, flags=re.IGNORECASE)
+            body = re.sub(r"</p>", "\n", body, flags=re.IGNORECASE)
+            body = re.sub(r"</div>", "\n", body, flags=re.IGNORECASE)
+
+        body = re.sub(r"<script[^>]*>.*?</script>", "", body,
+                      flags=re.DOTALL | re.IGNORECASE)
+        body = re.sub(r"<style[^>]*>.*?</style>", "", body,
+                      flags=re.DOTALL | re.IGNORECASE)
+        body = re.sub(r"<[^>]+>", "", body)
+        body = body.replace("&nbsp;", " ").replace("&amp;", "&")
+        body = body.replace("&lt;", "<").replace("&gt;", ">")
+        body = body.replace("&quot;", '"').replace("&#39;", "'")
+        body = body.replace("​", "")
+
+        for para in body.split("\n"):
+            text = " ".join(para.split())
+            if not text:
+                continue
+            if level is not None:
+                lines.append({"text": text, "heading_level": level})
+            else:
+                lines.append({"text": text, "heading_level": None})
+    return lines
+
+
+def extract_altchunk_paragraphs(archive: zipfile.ZipFile) -> list[dict[str, Any]]:
+    """从 altChunk 格式的 docx 提取有序段落 [{text, heading_level}]。
+
+    无 altChunk 或解析失败时返回 []。这是三处消费方（extract_docx_units、
+    max_pipeline._build_para_text_map、writeback_engine）共享的唯一事实来源。
+    """
+    targets = _read_altchunk_targets(archive)
+    if not targets:
+        return []
+
+    paragraphs: list[dict[str, Any]] = []
+    for raw in targets:
+        html_text = _decode_mht_html(raw)
+        paragraphs.extend(_html_to_paragraphs(html_text))
+    return paragraphs
+
+
+def materialize_altchunk_paragraphs(body: Any, paragraphs: list[dict[str, Any]]) -> int:
+    """把 altChunk 段落物化为标准 w:p/w:r/w:t 元素，追加进 body（sectPr 之前）。
+
+    返回写入的段落数。调用方需自行 walk body 生成 P 编号——由于物化的 w:p
+    顺序与 extract_altchunk_paragraphs 列表一致，walk 出来的 P 编号三处一致。
+    """
+    from lxml import etree
+
+    # 移除既有 altChunk 元素（保留 sectPr）
+    for ac in body.findall(f"{W}altChunk"):
+        body.remove(ac)
+
+    for para in paragraphs:
+        p = etree.SubElement(body, f"{W}p")
+        r = etree.SubElement(p, f"{W}r")
+        t = etree.SubElement(r, f"{W}t")
+        t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+        t.text = para["text"]
+
+    # 把 sectPr 移到 body 末尾
+    sect_prs = body.findall(f"{W}sectPr")
+    for sp in sect_prs:
+        body.remove(sp)
+    if sect_prs:
+        body.append(sect_prs[-1])
+
+    return len(paragraphs)
+
+
 def _accepted_paragraph_text(paragraph: Any) -> str:
     """Return accepted-view text using the writeback engine's exact rules."""
     parts: list[str] = []
@@ -92,16 +282,34 @@ def _body_paragraphs(body: Any) -> Iterator[tuple[Any, str]]:
 
 
 def extract_docx_units(path: str | Path) -> list[dict[str, Any]]:
-    """Extract DOCX units with P numbers identical to the 02 writeback engine."""
+    """Extract DOCX units with P numbers identical to the 02 writeback engine.
+
+    altChunk 格式（PDF→Word 导出等）正文嵌在 MHT 里、无标准 w:p，此时
+    用 extract_altchunk_paragraphs 提取段落，P 编号与引擎物化后一致。
+    """
     from lxml import etree
 
     with zipfile.ZipFile(path, "r") as archive:
         root = etree.fromstring(archive.read("word/document.xml"))
         styles = _paragraph_styles(archive)
-
-    body = root.find(f"{W}body")
-    if body is None:
-        return []
+        body = root.find(f"{W}body")
+        if body is None:
+            return []
+        # 纯 altChunk 文档（无 w:p）→ 用共享解析器，保留 heading_level 供 MD 标题
+        altchunk_paras = extract_altchunk_paragraphs(archive)
+        if altchunk_paras and not any(
+                child.tag.rsplit("}", 1)[-1] == "p"
+                for child in body.iterchildren()):
+            return [
+                {
+                    "location": f"P{index}",
+                    "kind": "paragraph",
+                    "text": para["text"],
+                    **({"heading_level": para["heading_level"]}
+                       if para.get("heading_level") else {}),
+                }
+                for index, para in enumerate(altchunk_paras)
+            ]
 
     units: list[dict[str, Any]] = []
     for index, (paragraph, kind) in enumerate(_body_paragraphs(body)):

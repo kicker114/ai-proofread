@@ -944,93 +944,26 @@ def _convert_altchunk_to_paras(z, docx_path, doc_xml, body):
     """Convert altChunk (MHT/HTML embedded content) to standard w:p paragraphs.
 
     某些 PDF 转换工具/协作编辑器会产出 altChunk 格式的 docx，其正文不是
-    标准的 w:p 而是嵌入的 MHT 文件。此函数读取 MHT，解析为纯文本段落，
-    创建对应的 w:p/w:r/w:t XML 元素替换 body 中的 altChunk。
+    标准的 w:p 而是嵌入的 MHT 文件。复用 extract_source.extract_altchunk_paragraphs
+    （三处消费方共享同一份段落列表，P 编号严格一致），然后物化为 w:p。
     """
-    # Get relationships to map rId → target path
-    rels_xml = z.read('word/_rels/document.xml.rels').decode('utf-8')
-    rmap = {}
-    for m in re.finditer(r'<Relationship[^>]*>', rels_xml):
-        rid_m = re.search(r'Id="([^"]+)"', m.group())
-        tgt_m = re.search(r'Target="([^"]+)"', m.group())
-        if rid_m and tgt_m:
-            rmap[rid_m.group(1)] = tgt_m.group(1)
+    # 引擎可能作为独立脚本运行（sys.path[0]=src/）或被 import，两者都要兼容
+    try:
+        from .extract_source import (
+            extract_altchunk_paragraphs, materialize_altchunk_paragraphs)
+    except ImportError:
+        from extract_source import (
+            extract_altchunk_paragraphs, materialize_altchunk_paragraphs)
 
-    # Collect altChunk ids and their references
-    ac_refs = []
-    for ac in body.findall(qn('altChunk')):
-        rid = ac.get(rn('id')) or ac.get(f'{{{R}}}id')
-        if rid:
-            target = rmap.get(rid, '')
-            if target.startswith('/'):
-                target = target.lstrip('/')
-            elif not target.startswith('word/'):
-                target = os.path.join('word', target)
-            ac_refs.append((ac, rid, target))
-
-    if not ac_refs:
-        return
-
-    # Collect all paragraph content from all altChunks
-    all_lines = []
-    for _, _, target in ac_refs:
-        try:
-            raw = z.read(target).decode('utf-8', errors='replace')
-        except KeyError:
-            continue
-
-        # Strip MIME headers before first <html
-        idx = raw.find('<html')
-        if idx >= 0:
-            raw = raw[idx:]
-
-        # Strip HTML tags
-        html = re.sub(r'<script[^>]*>.*?</script>', '', raw,
-                       flags=re.DOTALL | re.IGNORECASE)
-        html = re.sub(r'<style[^>]*>.*?</style>', '', html,
-                       flags=re.DOTALL | re.IGNORECASE)
-        html = re.sub(r'<br\s*/?>', '\n', html, flags=re.IGNORECASE)
-        html = re.sub(r'</p>', '\n', html, flags=re.IGNORECASE)
-        html = re.sub(r'</div>', '\n', html, flags=re.IGNORECASE)
-        html = re.sub(r'<[^>]+>', '', html)
-        html = re.sub(r'&nbsp;', ' ', html)
-        html = re.sub(r'&amp;', '&', html)
-        html = re.sub(r'&lt;', '<', html)
-        html = re.sub(r'&gt;', '>', html)
-        html = re.sub(r'&quot;', '"', html)
-
-        for line in html.split('\n'):
-            line = line.strip().replace('\r', '')
-            if line:
-                all_lines.append(line)
-
-    if not all_lines:
+    paragraphs = extract_altchunk_paragraphs(z)
+    if not paragraphs:
         print('WARN: altChunk 提取为空', file=sys.stderr)
         return
 
-    # Remove altChunk elements from body, keeping only sectPr
-    for ac, _, _ in ac_refs:
-        body.remove(ac)
-
-    # Insert w:p elements for each text line
-    for line in all_lines:
-        p = etree.SubElement(body, qn('p'))  # inserted at end, before sectPr
-        r = etree.SubElement(p, qn('r'))
-        t = etree.SubElement(r, qn('t'))
-        t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-        t.text = line
-
-    # Move sectPr to end of body (it was likely after the altChunks)
-    sectPrs = body.findall(qn('sectPr'))
-    for sp in sectPrs:
-        body.remove(sp)
-    if sectPrs:
-        body.append(sectPrs[-1])
-
-    print(f'  altChunk → {len(all_lines)} w:p paragraphs')
+    n = materialize_altchunk_paragraphs(body, paragraphs)
+    print(f'  altChunk → {n} w:p paragraphs')
 
 
-# ── main ──────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(description='02: 审校 findings → docx 回写')
     ap.add_argument('output_dir', help='output_{docname} 目录')
@@ -1089,13 +1022,13 @@ def main():
     print(f'Doc: {docx_path} → {len(para_map)} paragraphs')
 
     # ── Handle altChunk (embedded MHT/HTML) ──
-    if not para_map:
-        ac = body.findall(qn('altChunk'))
-        if ac:
-            print('WARN: 文档为 altChunk 格式，正在转换为标准 w:p 段落...')
-            _convert_altchunk_to_paras(z, docx_path, doc_xml, body)
-            para_map, text_map = build_para_map(body)
-            print(f'  转换后: {len(para_map)} paragraphs')
+    # 有 altChunk 就转换（纯 altChunk 文档 para_map 为空；混合文档补全正文）
+    ac = body.findall(qn('altChunk'))
+    if ac:
+        print('WARN: 文档为 altChunk 格式，正在转换为标准 w:p 段落...')
+        _convert_altchunk_to_paras(z, docx_path, doc_xml, body)
+        para_map, text_map = build_para_map(body)
+        print(f'  转换后: {len(para_map)} paragraphs')
 
     # Read settings.xml for trackChanges injection
     settings_xml = None

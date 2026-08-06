@@ -125,13 +125,28 @@ def _build_para_text_map(docx_path: str) -> Dict[int, str]:
       - body 直接子级 w:p：非空文本 → pn 从 0 递增
       - w:tbl 内每个单元格段落（.//w:p）→ 同样编号（一个单元格段落 = 一个 P）
       - 空段落跳过（不占 P 编号）
+
+    altChunk 格式（PDF→Word 导出，正文嵌 MHT、无 w:p）：用共享解析器
+    extract_altchunk_paragraphs 取段落，P 编号与引擎物化后的 build_para_map
+    逐段一致（已用同一列表校验）。
     """
     import zipfile
     from lxml import etree
 
     with zipfile.ZipFile(docx_path, "r") as z:
         doc_xml = etree.fromstring(z.read("word/document.xml"))
-    body = doc_xml.find(f"{{{_W_NS}}}body")
+        body = doc_xml.find(f"{{{_W_NS}}}body")
+        # 纯 altChunk 文档（无 w:p）→ 直接从共享解析器建 text_map，
+        # P 编号与引擎物化后的 build_para_map 逐段一致
+        from .extract_source import extract_altchunk_paragraphs
+        has_wp = any(
+            child.tag.rsplit("}", 1)[-1] in ("p", "tbl")
+            for child in body.iterchildren()) if body is not None else False
+        if body is not None and not has_wp:
+            altchunk_paras = extract_altchunk_paragraphs(z)
+            if altchunk_paras:
+                return {pn: para["text"] for pn, para in enumerate(altchunk_paras)}
+
     text_map: Dict[int, str] = {}
     pn = 0
     if body is None:
@@ -627,104 +642,19 @@ def _render_finding_rows(findings: List[Dict]) -> str:
 def phase4_report(
         out_dir: str, docname: str,
         tgscc: List[Dict], variants: List[Dict], structure: List[Dict],
-        llm: List[Dict], align: Dict, extra: Optional[str] = "") -> str:
-    """生成自包含 master HTML 报告，聚合全部阶段发现。"""
-    def count(items): return len(items)
-    def err_count(items): return sum(1 for i in items if i.get("severity") == "error")
+        llm: List[Dict], align: Dict,
+        source_text: str = "", names: Optional[List[Dict]] = None,
+        model: str = "", extra: Optional[str] = "") -> str:
+    """生成自包含 master HTML 报告 — V3 深色主题 · 原文内嵌高亮。
 
-    stats_cards = [
-        ("TGSCC 汉字规范", count(tgscc), err_count(tgscc)),
-        ("异形词/词形", count(variants), err_count(variants)),
-        ("结构诊断", count(structure), err_count(structure)),
-        ("LLM 修正", count(llm), 0),
-        ("对齐差异", align.get("stats", {}).get("total", 0),
-         align.get("stats", {}).get("delete", 0) + align.get("stats", {}).get("insert", 0)),
-    ]
+    委托给 html_report_v3.phase4_report_v3()。
+    """
+    from .html_report_v3 import phase4_report_v3
 
-    cards = "".join(
-        f"<div class='card'><div class='num'>{n}</div>"
-        f"<div class='label'>{t}</div><div class='err'>{e} 处错误</div></div>"
-        for t, n, e in stats_cards)
-
-    align_stats = align.get("stats", {})
-    align_html = os.path.basename(align.get("html", ""))
-    stats_line = " · ".join(f"{k}: {v}" for k, v in align_stats.items()) or "-"
-
-    report = f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<title>最大化审校报告 — {html.escape(docname)}</title>
-<style>
-:root {{ --bg:#f7f8fa; --card:#fff; --line:#e4e7ec; --err:#d03050; --warn:#b58900; --info:#6b7280; }}
-* {{ box-sizing:border-box; margin:0; padding:0; }}
-body {{ font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif; background:var(--bg); color:#1f2329; line-height:1.6; }}
-.wrap {{ max-width:1100px; margin:0 auto; padding:24px; }}
-h1 {{ font-size:22px; margin-bottom:4px; }}
-.sub {{ color:#6b7280; font-size:13px; margin-bottom:20px; }}
-.cards {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; margin-bottom:24px; }}
-.card {{ background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px 16px; }}
-.card .num {{ font-size:26px; font-weight:700; }}
-.card .label {{ font-size:13px; color:#4b5563; }}
-.card .err {{ font-size:12px; color:var(--err); }}
-section {{ background:var(--card); border:1px solid var(--line); border-radius:8px; padding:18px 20px; margin-bottom:16px; }}
-h2 {{ font-size:16px; margin-bottom:12px; padding-bottom:8px; border-bottom:1px solid var(--line); }}
-table {{ width:100%; border-collapse:collapse; font-size:13px; }}
-th,td {{ text-align:left; padding:6px 8px; border-bottom:1px solid #f0f1f3; vertical-align:top; }}
-th {{ background:#fafafa; font-weight:600; }}
-.sev-err td:first-child {{ color:var(--err); font-weight:600; }}
-.sev-warn td:first-child {{ color:var(--warn); }}
-.empty {{ color:#9ca3af; text-align:center; }}
-a {{ color:#1f5eff; text-decoration:none; }}
-a:hover {{ text-decoration:underline; }}
-.badge {{ display:inline-block; background:#eef2ff; color:#4f46e5; border-radius:4px; padding:1px 8px; font-size:12px; }}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <h1>📋 最大化审校报告</h1>
-  <div class="sub">文件：{html.escape(docname)} · 生成时间：{time.strftime("%Y-%m-%d %H:%M")} {extra}</div>
-
-  <div class="cards">{cards}</div>
-
-  <section>
-    <h2>0a · TGSCC 汉字规范检查 <span class="badge">确定性</span></h2>
-    <table><tr><th>类型</th><th>位置</th><th>原文</th><th>建议</th><th>依据</th></tr>
-    {_render_finding_rows(tgscc)}</table>
-  </section>
-
-  <section>
-    <h2>0b · 异形词 / 不规范词形 <span class="badge">确定性</span></h2>
-    <table><tr><th>类型</th><th>位置</th><th>原文</th><th>建议</th><th>依据</th></tr>
-    {_render_finding_rows(variants)}</table>
-  </section>
-
-  <section>
-    <h2>0c · 结构检查 <span class="badge">确定性</span></h2>
-    <table><tr><th>类型</th><th>位置</th><th>原文</th><th>建议</th><th>依据</th></tr>
-    {_render_finding_rows(structure)}</table>
-  </section>
-
-  <section>
-    <h2>1 · LLM 审校（JSON 发现模式） <span class="badge">模型</span></h2>
-    <table><tr><th>类型</th><th>位置</th><th>原句</th><th>修正后</th><th>相似度</th></tr>
-    {_render_finding_rows(llm)}</table>
-  </section>
-
-  <section>
-    <h2>3 · 句子对齐 <span class="badge">锚点算法</span></h2>
-    <p>统计：{html.escape(stats_line)}</p>
-    <p><a href="{html.escape(align_html)}" target="_blank">📄 打开句子级对齐勘误表 →</a></p>
-  </section>
-
-</div>
-</body>
-</html>"""
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"{docname}_max_report.html")
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(report)
-    return out_path
+    return phase4_report_v3(
+        out_dir=out_dir, docname=docname, source_text=source_text,
+        tgscc=tgscc, variants=variants, structure=structure,
+        llm=llm, names=names, align=align, model=model, extra=extra or "")
 
 
 # ── 主流程 ────────────────────────────────────────────────────────────
@@ -837,7 +767,9 @@ def run_max(
     print("\n[Phase 4] 综合报告...")
     extra = f"· 模型 {model} · 并发 {concurrent}"
     report_path = phase4_report(
-        out_dir, docname, tgscc, variants, structure, llm, align, extra)
+        out_dir, docname, tgscc, variants, structure,
+        llm, align, source_text=text, names=names,
+        model=model, extra=extra)
     results["report_path"] = report_path
     print(f"  ✓ 报告: {report_path}")
 
