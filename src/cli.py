@@ -692,7 +692,7 @@ def main():
     )
     b.add_argument("--model", default=DEFAULT_MODEL, choices=AVAILABLE_MODELS)
     b.add_argument("--rpm", type=int, default=15, help="API 速率限制 (默认 15)")
-    b.add_argument("--concurrent", type=int, default=3, help="并发数 (默认 3)")
+    b.add_argument("--concurrent", type=int, default=8, help="并发数 (默认 8)")
     b.add_argument("--no-diff", action="store_true")
     b.add_argument("--no-view", action="store_true")
 
@@ -715,7 +715,7 @@ def main():
     m = sub.add_parser("max", aliases=["m"], help="最大化检查（全环节打通）")
     m.add_argument("file", help="要检查的文件 (.md / .docx)")
     m.add_argument("--model", default=DEFAULT_MODEL, choices=AVAILABLE_MODELS)
-    m.add_argument("--concurrent", type=int, default=3, help="LLM 并发数 (默认 3)")
+    m.add_argument("--concurrent", type=int, default=8, help="LLM 并发数 (默认 8)")
     m.add_argument("--rpm", type=int, default=15, help="API 速率限制 (默认 15)")
     m.add_argument("--chunk-size", type=int, default=200,
                    help="每块目标字数 (默认 200)")

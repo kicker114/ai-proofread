@@ -82,7 +82,7 @@ proofread s  <file.md>                   # TGSCC 汉字规范专项检查
 | 参数 | 说明 |
 |------|------|
 | `--model` | 模型选择：`deepseek-v4-flash`（默认）/ `deepseek-v4-pro` / 旧名 |
-| `--concurrent N` | LLM 并发数（book/max 模式，默认 3） |
+| `--concurrent N` | LLM 并发数（book/max 模式，默认 8） |
 | `--rpm N` | API 速率限制（默认 15） |
 | `--chunk-size N` | max 分块目标字数（默认 200；质量回归通过前不要改默认） |
 | `--names` | max 模式启用专名查词（需词典） |

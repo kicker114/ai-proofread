@@ -36,7 +36,7 @@ proofread d  <original.md> <proofed.md>  # HTML word-level diff
 proofread s  <file.md>                   # TGSCC Chinese character spec check
 ```
 
-Key flags: `--model` (default `deepseek-v4-flash`), `--concurrent N` (LLM concurrency, default 3), `--rpm N` (API rate limit), `--chunk-size N` (max target size, default 200), `--names` (max mode proper-noun dictionary lookup), `--writeback` (max mode auto-writeback to DOCX).
+Key flags: `--model` (default `deepseek-v4-flash`), `--concurrent N` (LLM concurrency, default 8), `--rpm N` (API rate limit), `--chunk-size N` (max target size, default 200), `--names` (max mode proper-noun dictionary lookup), `--writeback` (max mode auto-writeback to DOCX).
 
 ## Codex project entry (Word + PDF)
 
