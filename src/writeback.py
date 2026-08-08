@@ -65,8 +65,23 @@ ROUTING = {
 _DEFAULT_ROUTE = ("verify", "💬待核【审校】")
 
 
-def _route(phase: str, severity: str) -> tuple:
-    """查路由表获取 (fix_class, comment_prefix)。"""
+_VALID_FIX_CLASSES = ("must_fix", "polish", "verify")
+
+
+def _route(phase: str, severity: str, explicit_fix_class: str = "") -> tuple:
+    """查路由表获取 (fix_class, comment_prefix)。
+
+    A3 修复：若 finding 自带显式 fix_class（合法值），优先尊重它，
+    不再只凭 phase+severity 推断。explicit_fix_class 为空时回退路由表推断。
+    """
+    if explicit_fix_class in _VALID_FIX_CLASSES:
+        # 显式 fix_class → 用对应前缀；无前缀映射时用通用待核
+        prefix_map = {
+            "must_fix": "【必改·",
+            "polish": "💬润色【",
+            "verify": "💬待核【",
+        }
+        return explicit_fix_class, prefix_map[explicit_fix_class]
     for prefix, table in ROUTING.items():
         if phase.startswith(prefix):
             return table.get(severity, ("verify", "💬待核"))
@@ -129,7 +144,9 @@ def findings_to_adeu_changes(findings: List[Dict]) -> List[Dict]:
         text = _safe_text(f)
         suggestion = _safe_suggestion(f)
         severity = f.get("severity", "info")
-        fix_class, prefix = _route(phase, severity)
+        # A3 修复：尊重 finding 显式 fix_class，无则回退 phase+severity 路由
+        explicit = str(f.get("fix_class", "")).strip().lower()
+        fix_class, prefix = _route(phase, severity, explicit)
 
         if not text:
             stats["skipped"] += 1
