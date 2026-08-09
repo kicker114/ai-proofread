@@ -281,15 +281,22 @@ proofread m 书稿.md --no-view --concurrent 3 --rpm 15 --chunk-size 200
   identity includes source hash, model, prompt hash, chunk-size and chunk hash.
 - API retries are explicit and observable: SDK retries are disabled, timeout is
   `API_TIMEOUT_SECONDS` (120s, per-inactivity — a trickling server can reset it
-  indefinitely), and each logical request has at most two retries. Empty or
-  invalid JSON responses are failures, not successful empty reviews.
+  indefinitely), and each logical request has at most two retries with exponential
+  backoff (`API_RETRY_DELAYS = (15s, 45s)` ±30% jitter, configurable for tests).
+  Empty or invalid JSON responses are failures, not successful empty reviews.
+- **DeepSeek/Aliyun 强制直连**: `_get_openai_client` 用显式 `http_client=httpx.Client(
+  proxy=None)` 创建，不读环境代理（HTTP_PROXY/HTTPS_PROXY/ALL_PROXY），规避本地
+  Clash 等代理注入的失败点。Google genai 客户端保持系统默认（trust_env），需代理
+  环境（大陆访问 gemini）不受影响。
 - Phase 1 has a wall-clock watchdog per chunk: `worker` wraps the API call in
   `asyncio.wait_for(..., timeout=request_timeout)` (default 180s, override with
   `--request-timeout N`). A chunk that never returns is marked `failed`
-  (checkpoint error "墙钟超时 Ns") and the run fast-fails with a resumable
-  checkpoint instead of hanging forever; `cmd_max` then exits via `os._exit(1)`
-  because timed-out executor threads cannot be cancelled and would otherwise
-  block interpreter exit.
+  (checkpoint error "墙钟超时 Ns"). 
+- **Phase 1 自动续跑**: 失败块记 checkpoint 后 run_max 自动重跑（最多
+  `MAX_PHASE1_ROUNDS=3` 轮，轮间退避 `PHASE1_RETRY_DELAY_BASE` 递增）。服务端
+  时点性劣化（高峰空响应/慢响应）等负载回落即自动收敛，一次命令最终审完；
+  轮次耗尽仍抛 RuntimeError fast-fail。`cmd_max` 捕获后 flush + `os._exit(1)`
+  （timed-out executor threads 不可取消，避免 _python_exit join 卡退出）。
 - The max report includes phase wall time, logical calls, attempts, retries, rate-limit
   waits and checkpoint hits. A second run should produce zero API calls for completed chunks.
 
