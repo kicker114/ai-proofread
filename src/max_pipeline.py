@@ -1142,8 +1142,19 @@ def run_max(
         # 的 _python_exit 会在进程退出时无条件 join 这些线程导致退出挂起，
         # 由 CLI 层 flush 后 os._exit 兜底。
         try:
-            from .proofreader import _API_EXECUTOR
-            _API_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+            # 释放 API 线程池：不再接受新任务。超时放弃的请求线程无法被取消，
+            # 会继续阻塞到 SDK 超时或更久；若在此处正常退出，concurrent.futures
+            # 的 _python_exit 会在进程退出时无条件 join 这些线程导致退出挂起，
+            # 由 CLI 层 flush 后 os._exit 兜底。
+            # shutdown 是一次性操作：模块级 executor 一旦关闭，同进程内后续
+            # run（测试套件 / 库调用）提交新任务必抛
+            # "cannot schedule new futures after shutdown"，因此关闭后立刻
+            # 重建一个新池替换模块级引用（旧池线程不 join，靠 SDK 超时自清）。
+            from concurrent.futures import ThreadPoolExecutor
+            from . import proofreader as _pr
+            _pr._API_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+            _pr._API_EXECUTOR = ThreadPoolExecutor(
+                thread_name_prefix="ai-proofread-api")
         except Exception:
             pass
         raise RuntimeError(

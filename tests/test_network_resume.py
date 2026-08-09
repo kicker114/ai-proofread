@@ -602,5 +602,71 @@ class RunMaxCheckpointIntegrationTests(unittest.TestCase):
             # n 块 × 每块每轮 1 次 × 2 轮（MAX_PHASE1_ROUNDS=2）
             self.assertEqual(api_calls, n_chunks * 2)
 
+    def test_failover_findings_written_back_to_docx(self):
+        """端到端：主模型重试耗尽 → failover 到备份模型成功 → findings 走完整
+        run_max + writeback 回写 DOCX（修订+批注，OOXML 审计通过）。
+
+        mock 底层 _deepseek_request_once（保留真 deepseek_async 的 failover 逻辑）：
+        主模型 qwen3.8-max 3 次空响应耗尽 → 自动切 deepseek-v4-flash 返回
+        {"findings": [...]}。验证 provider_failovers 计数、findings 完整、回写
+        产物落盘且通过审计。
+        """
+        from docx import Document
+        from src.writeback_engine import audit_docx
+
+        def fake_request(model, *_args, **_kwargs):
+            if model == "qwen3.8-max":
+                return None  # 主模型空响应（重试耗尽）
+            # 备份模型成功返回对象格式发现
+            return json.dumps({"findings": [{
+                "original_sentence": "小明看见一只票亮的蝴蝶。",
+                "corrected_sentence": "小明看见一只漂亮的蝴蝶。",
+            }]}, ensure_ascii=False)
+
+        alignment = {
+            "stats": {"match": 1, "delete": 0, "insert": 0},
+            "alignment": [],
+            "html": "alignment.html",
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source_docx = root / "source.docx"
+            doc = Document()
+            doc.add_paragraph("小明看见一只票亮的蝴蝶。")
+            doc.save(str(source_docx))
+            report = root / "report.html"
+            with patch("src.proofreader._deepseek_request_once",
+                       side_effect=fake_request), \
+                    patch("src.proofreader.API_RETRY_DELAYS", (0.0, 0.0)), \
+                    patch("src.max_pipeline.phase0_tgscc", return_value=[]), \
+                    patch("src.max_pipeline.phase0_variants", return_value=[]), \
+                    patch("src.max_pipeline.phase0_structure", return_value=[]), \
+                    patch("src.max_pipeline.phase3_align",
+                          return_value=alignment), \
+                    patch("src.max_pipeline.phase4_report",
+                          return_value=str(report)):
+                result = run_max(
+                    str(source_docx), model="qwen3.8-max",
+                    failover_models=["deepseek-v4-flash"],
+                    writeback=True, author="测试审校",
+                    concurrent=1, rpm=100000, chunk_size=200,
+                )
+
+            p1 = result["stats"]["phase1"]
+            self.assertEqual(p1["provider_failovers"], 1)
+            self.assertEqual(p1["failed_chunks"], 0)
+            self.assertEqual(p1["attempts"], 4)  # 主 3 次空 + 备份 1 次成功
+            self.assertEqual(len(result["llm"]), 1)
+            self.assertEqual(
+                result["llm"][0]["suggestion"], "小明看见一只漂亮的蝴蝶。")
+
+            review_path = Path(result["review_path"])
+            self.assertTrue(review_path.exists())
+            self.assertEqual(review_path.name, "source_审阅版.docx")
+            audit = audit_docx(
+                review_path, expected_author="测试审校",
+                require_revisions=True)
+            self.assertEqual(audit["relationships"], "ok")
+
 if __name__ == "__main__":
     unittest.main()
