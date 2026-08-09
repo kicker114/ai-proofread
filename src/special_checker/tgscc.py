@@ -20,7 +20,13 @@ class TGSCCChecker:
         self.tgscc_to_traditional_kanji_list_notes_path = (
             "D:/语文出版社/语文社工具书/通用规范汉字表/通用规范汉字表规范字与繁体字、异体字对照表注释.md"
         )
-        self.tgscc_data_path = "src/resource/tgscc_data.json"
+        # 相对路径只在仓库根目录下有效，换个工作目录就会退回到
+        # 上面那三个 Windows 绝对路径并抛 FileNotFoundError。
+        # 改为基于模块位置解析，任何 CWD 下都能命中已缓存的 JSON。
+        self.tgscc_data_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "resource", "tgscc_data.json",
+        )
 
         # 预编译正则表达式
         self.pinzi_pattern = re.compile(r'〖([^〗]+)〗(\d*)')
