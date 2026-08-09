@@ -272,3 +272,57 @@ python3 -m unittest \
 3. 提交时保留用户原有 `.workbuddy/memory/2026-08-05.md` 修改，不回退，也不要误称为本次实现。
 4. 对新的真实稿件始终先生成审校源/哈希；PDF 必须先 dry-run。
 5. 长稿审校用 `--concurrent 8 --rpm 60`（实测提速 5 倍，质量不变）。
+
+## 2026-08-09 技术更新（本日新增：月球之书试点 + proofread max 挂起诊断 + CC 等价适配判定）
+
+### 月球之书试点（p10-11 跨页）
+- 用 DeepSeek `proofread max` 跑《月球之书》THE MOON 跨页 p10-11 试点；3 条必改发现已确认并以字符级 PDF 高亮写回：①"月球表面有6 972个…"空格修正 ②"78% 的部分"空格修正 ③"美国国家航天局 → 美国国家航空航天局"（机构全称）。
+- 注：3 条发现源自 `rebuild_blocks.py`（PyMuPDF 按列重拼语义版块）产出，非 `proofread max` 的 LLM 输出；`proofread max` 本身在本次试点中挂起（见下）。
+
+### proofread max 44 分钟挂起（根因已确诊）
+- 现象：后台任务 `0cQC9N` 跑 `proofread max ... --concurrent 3 --rpm 15 --chunk-size 200`，44+ 分钟仅完成 5 块中 1 块、无 failed checkpoint、进程不退不报错。
+- 根因（CC 等价子 agent 确认）：httpx read timeout 按"距上次收字节"计时，DeepSeek 高负载下 trickle/静默持连接使 300s 超时永不触发；`phase1_json_proofread` 裸 `asyncio.gather` 无 `asyncio.wait_for` 墙钟看门狗 → 单块卡死整段 Phase 1（死锁）。`| tail -40` 仅掩盖 stdout，非致因。
+- 死进程：`0cQC9N` 在 sandbox 命名空间内，shell 的 ps/pkill/pgrep 返回 "operation not permitted"/exit 1，无法从本 shell 杀，须由任务机制回收。
+
+### 部分编辑（已完成 → 见下方「修复已实施」）
+- `src/max_pipeline.py` 的 `phase1_json_proofread` 已加 `request_timeout: float = 180.0` 参数 + docstring（行 628-636）；worker(:697)/asyncio.gather(:717) 尚未包 wait_for；行 637 残留重复 docstring 死字面量（应删）。CC 判定：完成而非回退。
+
+### CC 等价适配判定（入口层无 bug，修复落代码层）
+- 主推 (b)：在 `max_pipeline.py` `worker` 内 `await asyncio.wait_for(_proofread_one_json(...), timeout=request_timeout)`；捕 `TimeoutError` → `result=None` 告警，复用 failed checkpoint 分支（error="墙钟超时 Ns"）→ `run_max` fast-fail 可续跑。
+- 最小集 = b + c：`cli.py` 加 `--request-timeout`（default 180.0）透传 `run_max → phase1`。
+- (a) 辅助：`proofreader.py` `API_TIMEOUT_SECONDS` 300→120。
+- (d) 否定：入口/WorkBuddy skill 层无 bug（`load_dotenv` 正常、传参链完整），是同入口无关的鲁棒性缺口，不在该层修。
+- CC 不挂 ≠ 代码安全：同代码同路径，CC 不挂是 DeepSeek 间歇负载 + 参数差异的抽样运气。
+- VERDICT：只有 `worker` 内 `asyncio.wait_for` 能把无界阻塞变可恢复的失败。
+- 残留风险：`run_in_executor` future 不可取消；`_API_EXECUTOR` 非 daemon，atexit join 卡线程；建议 fast-fail 前 `_API_EXECUTOR.shutdown(wait=False, cancel_futures=True)` + 必要时 `os._exit` 兜底。
+
+### 修复已实施（2026-08-09 晚，Claude Code 落地）
+按最小充分集完成，全部改动在本仓库 `src/` + `tests/`：
+- `max_pipeline.py`：`worker` 内 `asyncio.wait_for(_proofread_one_json(...), timeout=request_timeout)`，捕 `asyncio.TimeoutError` → `result=None` + `api_stats['failures']+=1`，failed checkpoint 写「墙钟超时 Ns」；删行 637 重复 docstring；`run_max` 新增 `request_timeout=180.0` 透传 phase1；fast-fail 前 `_API_EXECUTOR.shutdown(wait=False, cancel_futures=True)`。
+- `cli.py`：`max` 子命令新增 `--request-timeout`（default 180.0，>0 校验）透传 run_max；捕获 `RuntimeError` → flush 后 `os._exit(1)`（规避 `concurrent.futures._python_exit` 无条件 join 泄漏线程导致的退出挂起）。
+- `proofreader.py`：`API_TIMEOUT_SECONDS` 300→120（仅辅助，trickle 下 per-inactivity 超时仍可被无限重置，真正的墙钟看门狗是 wait_for）。
+- `tests/test_network_resume.py`：`timeout=300.0` 断言改为引用常量；新增 `test_wall_clock_timeout_marks_chunk_failed_and_resumes`（模拟永不返回 → 超时记 failed → 续跑只补失败块）。
+- 验证：`tests.test_network_resume` 9/9、专项回归 133 项、固定样本 `validate_synthetic.py` 64/5/2 全过、`compileall` + `git diff --check` 通过；CLI 参数注册、非法值退出码 2、cli→run_max 透传 42.0 均已实测。
+- 待办（不在本次最小集）：`proofread b` 的 `process_paragraphs_async` 与 `chat_google_async` 仍有同类无界阻塞；长期正解是把 `deepseek_async` 热路径迁到 `AsyncOpenAI` 让 wait_for 真正取消连接（消除线程泄漏与 os._exit 需要）。
+
+### 修复后隔离复测（2026-08-09 22:32，task goS3o6）
+- 复测：`timeout 1500 /usr/local/opt/python@3.14/bin/python3.14 -m src.cli max /tmp/moon_test/review_prose.md --no-view --concurrent 3 --rpm 15 --chunk-size 200 --request-timeout 120` → **EXIT=0，墙钟 192s，未挂起**（对比当初 44min 卡死）。日志 `/tmp/moon_test/run.log`。
+- Phase 1 统计：`块=4 失败=2 | API尝试=10 重试=6 空响应=6 JSON无效=0 | 墙钟=192.22s`；最终"✓ 5 条修正"。
+- 结论：**挂死已修复**；但本次未触发 trickle 路径（响应均在 ~40s 内返回，看门狗未 fire，机制就位待真实持连接场景压测）。
+
+### 空响应漏审硬化（已实施，2026-08-09 晚 Claude Code）
+**复测误判纠正**：核实 `/tmp/moon_test/.review_prose_max_checkpoint/c105334c0a026e1cb3ab/` 实际 checkpoint——
+chunk-000000 / chunk-000003 的 status 都是 `failed`、error=`墙钟超时 120s`，**不是**"0 发现 complete"；run.log 也显示
+`run_max` 抛了 RuntimeError、cmd_max 打印"❌ Phase 1 存在失败分块（2 块）"。即：那次复测里 2 块漏审是被**看门狗**
+显式标 failed（failed_chunks=2，exit 应为 1），**并没有静默吞成 0 发现**。HANDOFF 此前"failed_chunks=0/EXIT=0"系误读。
+
+**但"空响应→0 发现"是真实的潜在漏洞，已硬化**：`_json_extract` 用 `find("[")...rfind("]")` 从任意文本抠数组，
+若 DeepSeek 返回 `{"issues": []}` 这类**对象格式**（prompt 要求数组）会被误解析成空数组 → 记"审完 0 发现"→ 静默漏审。
+- `_json_extract` 现在区分格式：文本以 `{` 开头 → 按对象解析，取 issues/changes/findings/corrections 数组；
+  非空 → 救回发现；**键存在但为空 → 返回 None → invalid → failed**（不再被当 0 发现）；无匹配键/解析失败 → None。
+  文本以 `[` 开头 → 规范数组；`[]` 仍是合法干净块（符合 prompt），不被误判失败。
+- `_proofread_one_json` 0 发现打印改为 `审完 0 发现（干净块）`，与失败/超时告警区分。
+- 空响应（None/空串）本就由 `deepseek_async` 重试 3 次 → `None` → failed（既有路径），本次未改其语义。
+- 测试：`tests.test_network_resume` 新增 3 例（对象空 issues → failed；对象非空 issues → 提取；裸 `[]` → complete）。
+- 验证：`tests.test_network_resume` 12/12、全量专项回归 145 项、固定样本 64/5/2、compileall、`git diff --check` 全过。
+- 交付交接文档：`/Users/kicker114/Downloads/HANDOFF.md`（含复测结果、空响应 bug、CC 下一步动作与 Resume Prompt）。
