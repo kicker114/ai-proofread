@@ -291,7 +291,11 @@ proofread m 书稿.md --no-view --concurrent 3 --rpm 15 --chunk-size 200
 - Phase 1 has a wall-clock watchdog per chunk: `worker` wraps the API call in
   `asyncio.wait_for(..., timeout=request_timeout)` (default 180s, override with
   `--request-timeout N`). A chunk that never returns is marked `failed`
-  (checkpoint error "墙钟超时 Ns"). 
+  (checkpoint error "墙钟超时 Ns"). **failover × watchdog 预算**: 每个 provider
+  腿的退避延迟（~15s+45s，±30% 抖动）在 failover 前先烧掉；`--request-timeout`
+  若小于该窗口，块会先被看门狗判死、备份根本没机会被调用（Phase1 自动续跑只会
+  重复被杀）。默认 180s 覆盖单腿 failover（实测 76.5s）；每加一个
+  `--failover-models` 备选模型，需相应加大 `--request-timeout`（≈ 备选数 × 90s）。
 - **Phase 1 自动续跑**: 失败块记 checkpoint 后 run_max 自动重跑（最多
   `MAX_PHASE1_ROUNDS=3` 轮，轮间退避 `PHASE1_RETRY_DELAY_BASE` 递增）。服务端
   时点性劣化（高峰空响应/慢响应）等负载回落即自动收敛，一次命令最终审完；

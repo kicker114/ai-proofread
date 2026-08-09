@@ -698,6 +698,7 @@ async def phase1_json_proofread(
         "failures": 0,
         "empty_responses": 0,
         "invalid_json": 0,
+        "provider_failovers": 0,
         "rate_wait_seconds": 0.0,
         "request_seconds": 0.0,
     }
@@ -867,6 +868,7 @@ async def phase1_json_proofread(
         f"本次调用={stats['attempted_chunks']} "
         f"失败={stats['failed_chunks']} | "
         f"API尝试={stats['attempts']} 重试={stats['retries']} "
+        f"切换={stats['provider_failovers']} "
         f"空响应={stats['empty_responses']} JSON无效={stats['invalid_json']} | "
         f"限速等待={stats['rate_wait_seconds']:.2f}s "
         f"请求累计={stats['request_seconds']:.2f}s "
