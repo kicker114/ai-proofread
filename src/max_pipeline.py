@@ -44,6 +44,12 @@ _DATA_DIR = _PROJECT_ROOT / "reliable-proofreading-data"
 _RES_DIR = Path(__file__).resolve().parent / "resource"
 MAX_CHECKPOINT_SCHEMA = "ai-proofread.max-checkpoint.v1"
 
+# Phase 1 自动续跑：失败块记 checkpoint 后自动重跑（只补失败块），最多轮数。
+# 服务端劣化（DeepSeek 高峰空响应/慢响应）常是时点性抖动，轮间退避等负载
+# 回落即自动收敛，避免一次命令中途退出需手动重跑。轮次耗尽仍 fast-fail。
+MAX_PHASE1_ROUNDS = 3
+PHASE1_RETRY_DELAY_BASE = 60.0  # 轮间基础退避秒数，第 n 轮失败后等 n * BASE
+
 DICT_PATHS = {
     "xianhan": "/Users/kicker114/Downloads/辞典/常用词典/现代汉语词典第7版/现代汉语词典第7版.mdx",
     "cihai": "/Users/kicker114/Downloads/辞典/常用词典/汉语辞海.mdx",
@@ -1058,12 +1064,34 @@ def run_max(
 
     print("  异步并发审校...")
     t0 = time.time()
-    llm_result = asyncio.run(phase1_json_proofread(
-        chunks, model=model, concurrent=concurrent, rpm=rpm,
-        checkpoint_root=checkpoint_root,
-        checkpoint_identity=checkpoint_identity,
-        system_prompt=system_prompt,
-        request_timeout=request_timeout))
+    # 自动续跑：失败块已记 checkpoint，重跑同一调用只补失败块（identity 相同）。
+    # 服务端劣化多为时点性抖动，轮间退避等负载回落即收敛；轮次耗尽仍 fast-fail。
+    phase1_round = 0
+    llm_result = None
+    while True:
+        phase1_round += 1
+        if phase1_round > 1:
+            delay = PHASE1_RETRY_DELAY_BASE * (phase1_round - 1)
+            print(
+                f"  ⏳ 第 {phase1_round - 1} 轮有失败块，{delay:.0f}s 后自动续跑"
+                "（checkpoint 只补失败块）..."
+            )
+            time.sleep(delay)
+        llm_result = asyncio.run(phase1_json_proofread(
+            chunks, model=model, concurrent=concurrent, rpm=rpm,
+            checkpoint_root=checkpoint_root,
+            checkpoint_identity=checkpoint_identity,
+            system_prompt=system_prompt,
+            request_timeout=request_timeout))
+        failed_now = llm_result.get("stats", {}).get("failed_chunks", 0)
+        if failed_now == 0:
+            break
+        if phase1_round >= MAX_PHASE1_ROUNDS:
+            print(
+                f"  ❌ 第 {phase1_round} 轮后仍有 {failed_now} 块失败"
+                f"（达自动续跑上限 {MAX_PHASE1_ROUNDS} 轮），已保留 checkpoint"
+            )
+            break
     llm = llm_result["findings"]
     refined_text = "\n".join(llm_result["refined_chunks"])
     # Layer A 丢弃（chunk 内定位失败）在 phase1 内收集；Layer B 丢弃（P 段

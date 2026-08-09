@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import httpx
+
 from src import proofreader
 from src.max_pipeline import phase1_json_proofread, run_max
 
@@ -29,12 +31,17 @@ class NetworkRetryTests(unittest.IsolatedAsyncioTestCase):
             second = proofreader._get_openai_client("deepseek-chat")
 
         self.assertIs(first, second)
-        factory.assert_called_once_with(
-            api_key=proofreader.os.getenv("DEEPSEEK_API_KEY"),
-            base_url="https://api.deepseek.com",
-            max_retries=0,
-            timeout=proofreader.API_TIMEOUT_SECONDS,
-        )
+        factory.assert_called_once()
+        _, kwargs = factory.call_args
+        self.assertEqual(kwargs["api_key"],
+                         proofreader.os.getenv("DEEPSEEK_API_KEY"))
+        self.assertEqual(kwargs["base_url"], "https://api.deepseek.com")
+        self.assertEqual(kwargs["max_retries"], 0)
+        self.assertEqual(kwargs["timeout"], proofreader.API_TIMEOUT_SECONDS)
+        # 强制直连：显式 http_client + proxy=None，不受环境/沙箱代理影响
+        hc = kwargs["http_client"]
+        self.assertIsInstance(hc, httpx.Client)
+        self.assertIsNone(hc._transport._pool._proxy)
 
     async def test_empty_responses_stop_after_two_observable_retries(self):
         limiter = CountingRateLimiter()
@@ -421,6 +428,95 @@ class RunMaxCheckpointIntegrationTests(unittest.TestCase):
                     encoding="utf-8"))
             self.assertEqual(saved["stats"]["phase1"]["logical_calls"], 0)
 
+    def test_failed_chunks_auto_rerun_until_clean(self):
+        """自动续跑：第 1 轮全失败，轮间退避后第 2 轮全部成功 → run_max 收敛
+        不抛错，失败块被补审，无需手动重跑。mock 直接替换 deepseek_async，
+        每块每轮恰好调 1 次（无内部重试）。"""
+        api_calls = 0
+
+        async def degraded_then_healthy(*_args, **_kwargs):
+            nonlocal api_calls
+            api_calls += 1
+            if api_calls <= round1_calls:  # 第 1 轮全空 → 全部 failed
+                return ""
+            return "[]"  # 第 2 轮健康
+
+        alignment = {
+            "stats": {"match": 1, "delete": 0, "insert": 0},
+            "alignment": [],
+            "html": "alignment.html",
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.md"
+            para = "很长的测试内容。" * 20  # 120 字
+            source.write_text(f"{para}\n\n{para}", encoding="utf-8")
+            from src.splitter import split_markdown_by_title_and_length_with_context
+            n_chunks = len(split_markdown_by_title_and_length_with_context(
+                source.read_text(encoding="utf-8"), levels=[1, 2], cut_by=150))
+            round1_calls = n_chunks  # 第 1 轮每块调 mock 1 次（空响应直接 fail）
+            report = Path(temp) / "report.html"
+            with patch("src.proofreader.deepseek_async",
+                       new=degraded_then_healthy), \
+                    patch("src.max_pipeline.PHASE1_RETRY_DELAY_BASE", 0.0), \
+                    patch("src.max_pipeline.phase0_tgscc", return_value=[]), \
+                    patch("src.max_pipeline.phase0_variants", return_value=[]), \
+                    patch("src.max_pipeline.phase0_structure", return_value=[]), \
+                    patch("src.max_pipeline.phase3_align",
+                          return_value=alignment), \
+                    patch("src.max_pipeline.phase4_report",
+                          return_value=str(report)):
+                result = run_max(
+                    str(source), concurrent=1, rpm=100000,
+                    chunk_size=150,
+                )
+
+            # 第 1 轮 n 次（全空）+ 第 2 轮 n 次（成功）
+            self.assertEqual(api_calls, n_chunks * 2)
+            self.assertEqual(result["stats"]["phase1"]["failed_chunks"], 0)
+            self.assertEqual(result["stats"]["phase1"]["attempted_chunks"],
+                             n_chunks)
+            self.assertEqual(result["stats"]["phase1"]["checkpoint_hits"], 0)
+
+    def test_auto_rerun_exhausts_rounds_then_fails(self):
+        """自动续跑轮次耗尽：持续空响应 → 达到 MAX_PHASE1_ROUNDS 后仍抛
+        RuntimeError（fast-fail + checkpoint 可续跑），不是无限重试。"""
+        api_calls = 0
+
+        async def always_empty(*_args, **_kwargs):
+            nonlocal api_calls
+            api_calls += 1
+            return ""
+
+        alignment = {
+            "stats": {"match": 1, "delete": 0, "insert": 0},
+            "alignment": [],
+            "html": "alignment.html",
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.md"
+            para = "很长的测试内容。" * 20
+            source.write_text(f"{para}\n\n{para}", encoding="utf-8")
+            from src.splitter import split_markdown_by_title_and_length_with_context
+            n_chunks = len(split_markdown_by_title_and_length_with_context(
+                source.read_text(encoding="utf-8"), levels=[1, 2], cut_by=150))
+            with patch("src.proofreader.deepseek_async", new=always_empty), \
+                    patch("src.max_pipeline.PHASE1_RETRY_DELAY_BASE", 0.0), \
+                    patch("src.max_pipeline.MAX_PHASE1_ROUNDS", 2), \
+                    patch("src.max_pipeline.phase0_tgscc", return_value=[]), \
+                    patch("src.max_pipeline.phase0_variants", return_value=[]), \
+                    patch("src.max_pipeline.phase0_structure", return_value=[]), \
+                    patch("src.max_pipeline.phase3_align",
+                          return_value=alignment), \
+                    patch("src.max_pipeline.phase4_report",
+                          return_value=str(temp)):
+                with self.assertRaises(RuntimeError):
+                    run_max(
+                        str(source), concurrent=1, rpm=100000,
+                        chunk_size=150,
+                    )
+
+            # n 块 × 每块每轮 1 次 × 2 轮（MAX_PHASE1_ROUNDS=2）
+            self.assertEqual(api_calls, n_chunks * 2)
 
 if __name__ == "__main__":
     unittest.main()

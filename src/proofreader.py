@@ -8,11 +8,13 @@ import json
 import time
 import asyncio
 import atexit
+import random
 import threading
 from functools import partial
 from typing import List, Callable
 from concurrent.futures import ThreadPoolExecutor
 
+import httpx
 from google import genai
 from google.genai import types
 from openai import OpenAI
@@ -31,7 +33,11 @@ with open(PROMPT_FILE_PATH, "r", encoding="utf-8") as file:
 
 API_TIMEOUT_SECONDS = 120.0
 API_MAX_ATTEMPTS = 3  # Initial request plus two explicit retries.
-API_RETRY_DELAYS = (5.0, 8.0)
+# 指数退避重试间隔（秒）。DeepSeek 高峰/劣化时瞬时请求常以空响应失败，
+# 5s/8s 太短（实测劣化窗口持续数十秒）无法跨过；放大到 15s/45s 并叠加
+# ±30% 随机抖动，分散并发重试。测试用 patch(API_RETRY_DELAYS, (0,0)) 不受影响。
+API_RETRY_DELAYS = (15.0, 45.0)
+API_RETRY_JITTER = 0.3  # ±30% 抖动
 
 _OPENAI_CLIENTS: dict[str, OpenAI] = {}
 _OPENAI_CLIENTS_LOCK = threading.Lock()
@@ -90,11 +96,20 @@ def _get_openai_client(model: str) -> OpenAI:
     with _OPENAI_CLIENTS_LOCK:
         client = _OPENAI_CLIENTS.get(provider)
         if client is None:
+            # 显式 http_client + proxy=None：强制直连，不读环境代理/沙箱透明代理。
+            # 实测 WorkBuddy 沙箱子进程虽无代理 env 变量，但宿主 Clash 仍可能在
+            # socket 层劫持流量；DeepSeek/Aliyun 走本地代理会引入额外的失败注入点
+            # （转隧道半开/间歇劣化）。Google genai 客户端保持系统默认（trust_env），
+            # 在需代理的环境（大陆访问 gemini）不受影响。
             client = OpenAI(
                 api_key=api_key,
                 base_url=base_url,
                 max_retries=0,
                 timeout=API_TIMEOUT_SECONDS,
+                http_client=httpx.Client(
+                    proxy=None,
+                    timeout=httpx.Timeout(API_TIMEOUT_SECONDS, connect=10.0),
+                ),
             )
             _OPENAI_CLIENTS[provider] = client
     return client
@@ -262,7 +277,9 @@ async def deepseek_async(
                 f"({elapsed:.2f}s)"
             )
         if attempt < API_MAX_ATTEMPTS:
-            delay = API_RETRY_DELAYS[attempt - 1]
+            base_delay = API_RETRY_DELAYS[attempt - 1]
+            delay = base_delay * random.uniform(
+                1.0 - API_RETRY_JITTER, 1.0 + API_RETRY_JITTER)
             print(f"API {model}{label}: {delay:.0f}s 后重试")
             await asyncio.sleep(delay)
 
