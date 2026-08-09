@@ -130,7 +130,6 @@ class MaxCheckpointTests(unittest.IsolatedAsyncioTestCase):
         chunks = [{"target": "第一段。", "context": ""}]
         identity = {
             "source_sha256": "a" * 64,
-            "model": "deepseek-v4-flash",
             "prompt_sha256": "b" * 64,
             "chunk_size": 200,
         }
@@ -157,7 +156,6 @@ class MaxCheckpointTests(unittest.IsolatedAsyncioTestCase):
         chunks = [{"target": "第一段。", "context": ""}]
         identity = {
             "source_sha256": "a" * 64,
-            "model": "deepseek-v4-flash",
             "prompt_sha256": "b" * 64,
             "chunk_size": 200,
         }
@@ -183,7 +181,6 @@ class MaxCheckpointTests(unittest.IsolatedAsyncioTestCase):
         chunks = [{"target": "第一段。", "context": ""}]
         identity = {
             "source_sha256": "a" * 64,
-            "model": "deepseek-v4-flash",
             "prompt_sha256": "b" * 64,
             "chunk_size": 200,
         }
@@ -212,7 +209,6 @@ class MaxCheckpointTests(unittest.IsolatedAsyncioTestCase):
         chunks = [{"target": "完全没问题的段落。", "context": ""}]
         identity = {
             "source_sha256": "a" * 64,
-            "model": "deepseek-v4-flash",
             "prompt_sha256": "b" * 64,
             "chunk_size": 200,
         }
@@ -238,13 +234,102 @@ class MaxCheckpointTests(unittest.IsolatedAsyncioTestCase):
                     (run_dir / "chunk-000000.json").read_text(encoding="utf-8"))
                 self.assertEqual(record["status"], "complete")
 
+    async def test_findings_object_empty_is_legit_clean_chunk(self):
+        """新规范对象格式的干净块（{"findings": []}）必须 complete，不能被误判失败。"""
+        chunks = [{"target": "完全没问题的段落。", "context": ""}]
+        identity = {
+            "source_sha256": "a" * 64,
+            "prompt_sha256": "b" * 64,
+            "chunk_size": 200,
+        }
+
+        async def clean(*_args, **_kwargs):
+            return '{"findings": []}'
+
+        with tempfile.TemporaryDirectory() as temp:
+            checkpoint_root = Path(temp) / "checkpoints"
+            with patch("src.proofreader.deepseek_async", new=clean):
+                result = await phase1_json_proofread(
+                    chunks, concurrent=1, rpm=100000,
+                    checkpoint_root=checkpoint_root,
+                    checkpoint_identity=identity,
+                    system_prompt="test prompt",
+                )
+            self.assertEqual(result["stats"]["failed_chunks"], 0)
+            self.assertEqual(result["stats"]["invalid_json"], 0)
+            self.assertEqual(result["findings"], [])
+
+    async def test_findings_object_nonempty_extracts(self):
+        """新规范对象格式非空（{"findings": [...]}）→ 提取发现。"""
+        chunks = [{"target": "第一段。", "context": ""}]
+        identity = {
+            "source_sha256": "a" * 64,
+            "prompt_sha256": "b" * 64,
+            "chunk_size": 200,
+        }
+
+        async def with_findings(*_args, **_kwargs):
+            return json.dumps({"findings": [{
+                "original_sentence": "第一段。",
+                "corrected_sentence": "第一段改。",
+            }]}, ensure_ascii=False)
+
+        with tempfile.TemporaryDirectory() as temp, patch(
+                "src.proofreader.deepseek_async", new=with_findings):
+            result = await phase1_json_proofread(
+                chunks, concurrent=1, rpm=100000,
+                checkpoint_root=Path(temp) / "checkpoints",
+                checkpoint_identity=identity,
+                system_prompt="test prompt",
+            )
+        self.assertEqual(result["stats"]["failed_chunks"], 0)
+        self.assertEqual(result["stats"]["invalid_json"], 0)
+        self.assertEqual(len(result["findings"]), 1)
+
+    async def test_failover_switches_provider_after_retry_exhaustion(self):
+        """多 provider failover：第一模型空响应耗尽 → 自动切到第二模型成功。"""
+        limiter = CountingRateLimiter()
+        stats = proofreader._new_api_stats()
+        # 第一模型 3 次全空，第二模型成功
+        def first_empty(*_a, **_kw):
+            return None
+        def second_ok(*_a, **_kw):
+            return "[]"
+        with patch("src.proofreader._deepseek_request_once",
+                   side_effect=[None, None, None, "[]"]) as req, \
+                patch("src.proofreader.API_RETRY_DELAYS", (0.0, 0.0)):
+            result = await proofreader.deepseek_async(
+                "target", "", "deepseek-v4-flash", limiter,
+                stats=stats, request_label="failover-test",
+                models=["deepseek-v4-flash", "kimi-k2.6"],
+            )
+        self.assertEqual(result, "[]")
+        self.assertEqual(req.call_count, 4)  # 3 次第一模型 + 1 次第二模型
+        self.assertEqual(stats["provider_failovers"], 1)
+        self.assertEqual(stats["failures"], 0)
+
+    async def test_failover_single_model_keeps_old_behavior(self):
+        """单模型（无 failover）：重试耗尽后失败，provider_failovers=0，行为不变。"""
+        limiter = CountingRateLimiter()
+        stats = proofreader._new_api_stats()
+        with patch("src.proofreader._deepseek_request_once",
+                   return_value=None) as req, \
+                patch("src.proofreader.API_RETRY_DELAYS", (0.0, 0.0)):
+            result = await proofreader.deepseek_async(
+                "target", "", "deepseek-v4-flash", limiter,
+                stats=stats, request_label="single-test",
+            )
+        self.assertIsNone(result)
+        self.assertEqual(req.call_count, 3)
+        self.assertEqual(stats["provider_failovers"], 0)
+        self.assertEqual(stats["failures"], 1)
+
     async def test_wall_clock_timeout_marks_chunk_failed_and_resumes(self):
         """墙钟看门狗：单块永不返回（模拟 DeepSeek 静默 trickle）时，
         request_timeout 后记 failed checkpoint，而不是永久挂起；续跑只补失败块。"""
         chunks = [{"target": "第一段。", "context": ""}]
         identity = {
             "source_sha256": "a" * 64,
-            "model": "deepseek-v4-flash",
             "prompt_sha256": "b" * 64,
             "chunk_size": 200,
         }
@@ -302,7 +387,6 @@ class MaxCheckpointTests(unittest.IsolatedAsyncioTestCase):
         ]
         identity = {
             "source_sha256": "a" * 64,
-            "model": "deepseek-v4-flash",
             "prompt_sha256": "b" * 64,
             "chunk_size": 200,
         }

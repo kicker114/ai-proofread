@@ -10,7 +10,8 @@ max_pipeline.py — ai-proofread 最大化检查模式
       0c. 结构检查（标题层级 hierarchy_gap/level_mismatch + 编号连续性）
 
     Phase 1: LLM 审校 —— JSON 发现模式（核心新增）
-      分块 → 异步并发 → 每块返回 [{original_sentence, corrected_sentence}]
+      分块 → 异步并发 → 每块返回 {"findings": [{original_sentence, corrected_sentence}]}
+      （对象包装，兼容多 provider 的 json_object 模式）
       → match_similar_text 模糊定位回写 → 精修版全文（保持原格式，非全文重写）
 
     Phase 2: 专名查词（可选 --names，需 MDict 词典文件）
@@ -62,11 +63,15 @@ DICT_PATHS = {
 def _json_extract(text: str) -> Optional[List[Dict]]:
     """从模型输出中稳健提取 JSON 发现数组。
 
-    规范输出是数组（prompt 要求，见 prompt-proofreader-system-outputJSON.xml）：
-    - 文本以 `[` 开头 → 提取顶层数组；空数组 `[]` 表示"审完无发现"（干净块）。
-    - 文本以 `{` 开头 → 对象格式漂移。尝试取 issues/changes/findings/corrections
-      数组：非空 → 救回有效发现；键存在但为空 → 返回 None（对象格式的空结果不可信，
-      判为 invalid → failed，避免被当成"0 发现"静默漏审）。无匹配键/解析失败 → None。
+    规范输出是对象 {"findings": [...]}（prompt 要求，见
+    prompt-proofreader-system-outputJSON.xml；对象格式让各 provider 的
+    json_object/json_schema 模式能 pin 结构）：
+    - {"findings": [...]} → 提取数组；{"findings": []} 表示"审完无发现"（干净块）。
+    - 兼容漂移：{"issues"/"changes"/"corrections": [...]} 非空 → 救回有效发现；
+      但错误键名的空对象数组（如 {"issues": []}）不可信 → 返回 None（判 invalid →
+      failed，避免模型用错键名时被当成"0 发现"静默漏审）。
+    - 裸数组 [...]（旧格式）→ 仍兼容；空数组 [] 仍是干净块。
+    - 无法解析 → None。
     """
     if not text:
         return None
@@ -78,7 +83,7 @@ def _json_extract(text: str) -> Optional[List[Dict]]:
     if not text:
         return None
     if text.startswith("{"):
-        # 对象格式漂移：模型返回了对象而非数组
+        # 规范对象格式
         end = text.rfind("}")
         if end <= 0:
             return None
@@ -88,13 +93,16 @@ def _json_extract(text: str) -> Optional[List[Dict]]:
             return None
         if not isinstance(obj, dict):
             return None
-        for key in ("issues", "changes", "findings", "corrections"):
+        # findings 是 canonical 键：空=干净块（合法）
+        if isinstance(obj.get("findings"), list):
+            return obj["findings"]
+        # 其余兼容键：非空救回，空不可信 → failed
+        for key in ("issues", "changes", "corrections"):
             val = obj.get(key)
             if isinstance(val, list):
-                # 空对象数组不可信（返回对象已是漂移）→ 判无效，不走"0 发现"完成
                 return val if val else None
         return None
-    # 数组格式（规范输出）
+    # 数组格式（旧格式兼容）
     start = text.find("[")
     end = text.rfind("]")
     if start == -1 or end == -1 or end <= start:
@@ -616,8 +624,13 @@ def phase0_structure(text: str, rules_path: Optional[str] = None) -> List[Dict]:
 async def _proofread_one_json(
         chunk: Dict, index: int, total: int, model: str, rate_limiter,
         system_prompt: str,
-        api_stats: Dict[str, int | float]) -> Optional[Dict]:
-    """处理单个 chunk，返回 {index, findings, chunk_text}。"""
+        api_stats: Dict[str, int | float],
+        models: Optional[List[str]] = None) -> Optional[Dict]:
+    """处理单个 chunk，返回 {index, findings, chunk_text}。
+
+    models: 多 provider failover 顺序（默认 [model]，单腿）。单 provider 耗尽重试
+    后由 deepseek_async 自动推进到下一个 model。
+    """
     from .proofreader import deepseek_async
 
     target_text = chunk.get("target", "")
@@ -636,6 +649,7 @@ async def _proofread_one_json(
         post_text, pre_text, model, rate_limiter,
         system_prompt=system_prompt, max_tokens=4096,
         stats=api_stats, request_label=f"chunk {index}/{total}",
+        models=models,
     )
 
     if not result:
@@ -661,7 +675,8 @@ async def phase1_json_proofread(
         checkpoint_root: str | Path | None = None,
         checkpoint_identity: Optional[Dict[str, Any]] = None,
         system_prompt: Optional[str] = None,
-        request_timeout: float = 180.0) -> Dict:
+        request_timeout: float = 180.0,
+        models: Optional[List[str]] = None) -> Dict:
     """异步并发 JSON 发现模式审校。返回 {findings, refined_chunks}。
 
     request_timeout: 单块墙钟看门狗（秒）。DeepSeek 在高负载下可能「收下请求
@@ -734,7 +749,7 @@ async def phase1_json_proofread(
                 result = await asyncio.wait_for(
                     _proofread_one_json(
                         chunk, idx + 1, len(chunks), model, rate_limiter,
-                        system_prompt, api_stats,
+                        system_prompt, api_stats, models=models,
                     ),
                     timeout=request_timeout,
                 )
@@ -980,11 +995,15 @@ def run_max(
         run_names: bool = False, verbose: bool = False,
         writeback: bool = False, author: str = "审校助手",
         chunk_size: int = 200,
-        request_timeout: float = 180.0) -> Dict:
+        request_timeout: float = 180.0,
+        failover_models: Optional[List[str]] = None) -> Dict:
     """执行完整 max 管线。返回各阶段结果与产物路径。
 
     writeback=True 时，审校完成后直接把发现回写到 DOCX（02 引擎，字符级修订+批注）。
     request_timeout: Phase 1 单块墙钟看门狗（秒），透传给 phase1_json_proofread。
+    failover_models: 多 provider 备选模型列表（如 ["qwen3.8-max"]）。Phase 1 单块在
+    model 重试耗尽后按此顺序自动推进；跨 provider 的失败块共享同一 checkpoint
+    （identity 不含 model），续跑只补失败块。
     """
     if chunk_size <= 0:
         raise ValueError("chunk_size 必须是正整数")
@@ -1017,9 +1036,11 @@ def run_max(
     review_source_sha256 = src_docx_sha256 or sha256_file(md_path)
     system_prompt = load_system_prompt("json")
     prompt_sha256 = _sha256_text(system_prompt)
+    # identity 不含 model：多 provider failover 时失败块可在不同模型/provider 间
+    # 续跑共享 checkpoint（DeepSeek 跑的块不被 qwen 重审）。副作用：旧 checkpoint
+    # 含 model 键、与当前 identity 不等 → 自动 cache miss（无害，run 重来）。
     checkpoint_identity = {
         "source_sha256": review_source_sha256,
-        "model": model,
         "prompt_sha256": prompt_sha256,
         "chunk_size": chunk_size,
     }
@@ -1082,7 +1103,9 @@ def run_max(
             checkpoint_root=checkpoint_root,
             checkpoint_identity=checkpoint_identity,
             system_prompt=system_prompt,
-            request_timeout=request_timeout))
+            request_timeout=request_timeout,
+            models=([model] + list(failover_models)
+                    if failover_models else None)))
         failed_now = llm_result.get("stats", {}).get("failed_chunks", 0)
         if failed_now == 0:
             break

@@ -39,6 +39,35 @@ API_MAX_ATTEMPTS = 3  # Initial request plus two explicit retries.
 API_RETRY_DELAYS = (15.0, 45.0)
 API_RETRY_JITTER = 0.3  # ±30% 抖动
 
+# 每模型的 provider 差异参数。temperature 默认 1.3（审校调优），这里只声明覆盖项；
+# temperature: None 表示该 provider 禁止传 temperature（如 Kimi，会报错）。
+# extra_body: 传给 OpenAI client 的 provider 专属参数。
+# response_format: 结构性输出（对象契约；契约见 prompt-proofreader-system-outputJSON.xml）。
+_MODEL_PARAMS: dict[str, dict] = {
+    # DeepSeek V4 thinking 默认开 → 烧输出预算致 JSON 截断/空响应（实测 40%→100%）
+    "deepseek-v4-flash": {"extra_body": {"thinking": {"type": "disabled"}}},
+    "deepseek-v4-pro": {"extra_body": {"thinking": {"type": "disabled"}}},
+    # 旧 alias 与 dashscope 的 deepseek-v3：不带 thinking 参数
+    "deepseek-chat": {},
+    "deepseek-reasoner": {},
+    "deepseek-v3": {},
+    # Qwen（dashscope）：json_object 模式 pin 对象结构。temperature 0.7 是
+    # 结构性输出的保守默认，待真实 key 验证后在固定 120 段样本上调优。
+    "qwen3.8-max": {"response_format": {"type": "json_object"}, "temperature": 0.7},
+    # Kimi K2.6（Moonshot）：thinking 默认开须关（否则烧 max_tokens 致 content=null）；
+    # 官方禁止传 temperature（会 400）；json_object 只出对象（契约已改对象）。
+    # 需 MOONSHOT_API_KEY；api.moonshot.cn 已在用户 NO_PROXY 豁免列表。
+    "kimi-k2.6": {
+        "extra_body": {"thinking": {"type": "disabled"}},
+        "temperature": None,
+        "response_format": {"type": "json_object"},
+    },
+    # GLM-4.7（智谱）：OpenAI 兼容，中文原生，快。需 ZHIPU_API_KEY。
+    # 重试需识别业务错误码 1302/1305/1308/1313（见研究，本次未接入错误码分类）。
+    "glm-4.7": {"response_format": {"type": "json_object"}},
+}
+_DEFAULT_TEMPERATURE = 1.3
+
 _OPENAI_CLIENTS: dict[str, OpenAI] = {}
 _OPENAI_CLIENTS_LOCK = threading.Lock()
 _API_EXECUTOR = ThreadPoolExecutor(thread_name_prefix="ai-proofread-api")
@@ -48,7 +77,8 @@ def load_system_prompt(mode: str = "rewrite") -> str:
     """按模式加载系统提示词。
 
     mode="rewrite"  全文重写模式（模型输出整个 target 的重写版）
-    mode="json"     JSON 发现模式（模型只输出 [{original_sentence, corrected_sentence}]）
+    mode="json"     JSON 发现模式（模型输出 {"findings": [{original_sentence, corrected_sentence}]}，
+                    对象包装以兼容多 provider 的 json_object 模式）
     """
     if mode == "json":
         with open(PROMPT_FILE_PATH_JSON, "r", encoding="utf-8") as file:
@@ -81,12 +111,17 @@ def _client_config(model: str) -> tuple[str, str | None, str]:
     }
     if model in direct_models:
         return "deepseek", os.getenv("DEEPSEEK_API_KEY"), "https://api.deepseek.com"
-    if model == "deepseek-v3":
+    if model in ("deepseek-v3", "qwen3.8-max"):
+        # dashscope 兼容端点：deepseek-v3 与 qwen 走同一 provider client（池化复用）
         return (
             "aliyun",
             os.getenv("ALIYPUN_API_KEY"),
             "https://dashscope.aliyuncs.com/compatible-mode/v1",
         )
+    if model == "kimi-k2.6":
+        return "moonshot", os.getenv("MOONSHOT_API_KEY"), "https://api.moonshot.cn/v1"
+    if model == "glm-4.7":
+        return "zhipu", os.getenv("ZHIPU_API_KEY"), "https://open.bigmodel.cn/api/paas/v4"
     raise ValueError(f"模型名称错误：{model}")
 
 
@@ -148,20 +183,26 @@ def _build_messages(content: str, reference: str,
 def _deepseek_request_once(model: str, messages: list[dict[str, str]],
                            max_tokens: int | None = None) -> str | None:
     client = _get_openai_client(model)
+    params = _MODEL_PARAMS.get(model, {})
     kwargs = {
         "model": model,
         "messages": messages,
-        "temperature": 1.3,
         "stream": False,
     }
+    temperature = params.get("temperature", _DEFAULT_TEMPERATURE)
+    if temperature is not None:  # None = provider 禁止传 temperature（如 Kimi）
+        kwargs["temperature"] = temperature
     if max_tokens:
         kwargs["max_tokens"] = max_tokens
-    if model in ("deepseek-v4-flash", "deepseek-v4-pro"):
+    extra = params.get("extra_body")
+    if extra:
         # DeepSeek V4 thinking mode 默认开启，把输出预算烧在内部推理上，负载高时
         # 直接导致 JSON 截断/空响应（实测默认成功率 40%、失败时 max_tokens 打满）。
-        # 显式关闭 thinking 后成功率 100%、输出 tokens 降到 ~1/6。旧 alias
-        # deepseek-chat/reasoner 与 dashscope 的 deepseek-v3 不传该参数。
-        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        # 显式关闭 thinking 后成功率 100%、输出 tokens 降到 ~1/6。
+        kwargs["extra_body"] = extra
+    response_format = params.get("response_format")
+    if response_format:
+        kwargs["response_format"] = response_format
     response = client.chat.completions.create(**kwargs)
     return response.choices[0].message.content
 
@@ -177,6 +218,7 @@ def _new_api_stats() -> dict[str, int | float]:
         "retries": 0,
         "failures": 0,
         "empty_responses": 0,
+        "provider_failovers": 0,
         "rate_wait_seconds": 0.0,
         "request_seconds": 0.0,
     }
@@ -232,9 +274,13 @@ async def deepseek_async(
         content: str, reference: str, model: str, rate_limiter: RateLimiter,
         system_prompt: str | None = None, max_tokens: int | None = None,
         stats: dict[str, int | float] | None = None,
-        request_label: str = "") -> str | None:
+        request_label: str = "",
+        models: list[str] | None = None) -> str | None:
     """
-    异步调用deepseek校对模型，返回校对后的文本
+    异步调用校对模型，返回校对后的文本。
+
+    models: 多 provider failover 顺序。单 provider 重试耗尽后自动推进到下一个
+    model（DeepSeek 失败 → qwen 等）。默认 [model]（单腿，行为与之前一致）。
     """
     if stats is None:
         stats = _new_api_stats()
@@ -242,55 +288,64 @@ async def deepseek_async(
     messages = _build_messages(content, reference, system_prompt)
     loop = asyncio.get_running_loop()
     label = f" {request_label}" if request_label else ""
+    candidates = list(models) if models else [model]
 
-    for attempt in range(1, API_MAX_ATTEMPTS + 1):
-        wait_started = time.perf_counter()
-        await rate_limiter.wait()
-        rate_wait = time.perf_counter() - wait_started
-        stats["rate_wait_seconds"] += rate_wait
-        stats["attempts"] += 1
-        if attempt > 1:
-            stats["retries"] += 1
-        print(
-            f"API {model}{label}: 尝试 {attempt}/{API_MAX_ATTEMPTS} "
-            f"(限速等待 {rate_wait:.2f}s)"
-        )
-        started = time.perf_counter()
-        try:
-            result = await loop.run_in_executor(
-                _API_EXECUTOR,
-                partial(_deepseek_request_once, model, messages, max_tokens),
-            )
-        except Exception as exc:
-            elapsed = time.perf_counter() - started
-            stats["request_seconds"] += elapsed
+    for mdl in candidates:
+        if mdl != candidates[0]:
+            stats["provider_failovers"] = stats.get("provider_failovers", 0) + 1
             print(
-                f"API {model}{label}: 尝试 {attempt} 异常 "
-                f"({elapsed:.2f}s): {exc}"
+                f"API {model}{label}: 切换 provider → {mdl}"
+                f"（{candidates.index(mdl)} 号备选）"
             )
-        else:
-            elapsed = time.perf_counter() - started
-            stats["request_seconds"] += elapsed
-            if isinstance(result, str) and result:
+        for attempt in range(1, API_MAX_ATTEMPTS + 1):
+            wait_started = time.perf_counter()
+            await rate_limiter.wait()
+            rate_wait = time.perf_counter() - wait_started
+            stats["rate_wait_seconds"] += rate_wait
+            stats["attempts"] += 1
+            if attempt > 1:
+                stats["retries"] += 1
+            print(
+                f"API {mdl}{label}: 尝试 {attempt}/{API_MAX_ATTEMPTS} "
+                f"(限速等待 {rate_wait:.2f}s)"
+            )
+            started = time.perf_counter()
+            try:
+                result = await loop.run_in_executor(
+                    _API_EXECUTOR,
+                    partial(_deepseek_request_once, mdl, messages, max_tokens),
+                )
+            except Exception as exc:
+                elapsed = time.perf_counter() - started
+                stats["request_seconds"] += elapsed
                 print(
-                    f"API {model}{label}: 尝试 {attempt} 成功 "
+                    f"API {mdl}{label}: 尝试 {attempt} 异常 "
+                    f"({elapsed:.2f}s): {exc}"
+                )
+            else:
+                elapsed = time.perf_counter() - started
+                stats["request_seconds"] += elapsed
+                if isinstance(result, str) and result:
+                    print(
+                        f"API {mdl}{label}: 尝试 {attempt} 成功 "
+                        f"({elapsed:.2f}s)"
+                    )
+                    return _clean_model_result(result)
+                stats["empty_responses"] += 1
+                print(
+                    f"API {mdl}{label}: 尝试 {attempt} 返回空 "
                     f"({elapsed:.2f}s)"
                 )
-                return _clean_model_result(result)
-            stats["empty_responses"] += 1
-            print(
-                f"API {model}{label}: 尝试 {attempt} 返回空 "
-                f"({elapsed:.2f}s)"
-            )
-        if attempt < API_MAX_ATTEMPTS:
-            base_delay = API_RETRY_DELAYS[attempt - 1]
-            delay = base_delay * random.uniform(
-                1.0 - API_RETRY_JITTER, 1.0 + API_RETRY_JITTER)
-            print(f"API {model}{label}: {delay:.0f}s 后重试")
-            await asyncio.sleep(delay)
+            if attempt < API_MAX_ATTEMPTS:
+                base_delay = API_RETRY_DELAYS[attempt - 1]
+                delay = base_delay * random.uniform(
+                    1.0 - API_RETRY_JITTER, 1.0 + API_RETRY_JITTER)
+                print(f"API {mdl}{label}: {delay:.0f}s 后重试")
+                await asyncio.sleep(delay)
+        print(f"API {mdl}{label}: {API_MAX_ATTEMPTS} 次尝试均失败")
 
     stats["failures"] += 1
-    print(f"API {model}{label}: {API_MAX_ATTEMPTS} 次尝试均失败")
+    print(f"API {model}{label}: 全部候选 provider 均失败")
     return None
 
 # 配置Google API（懒加载——仅在使用 Google 模型时初始化）

@@ -1,335 +1,110 @@
-# HANDOFF — ai-proofread Codex Word/PDF 审校入口（2026-08-06）
+# HANDOFF — ai-proofread 审校 CLI 当前状态（2026-08-10）
 
 **Scope:** `/Users/kicker114/Developer/ai-proofread`
-**Branch / HEAD:** `main` / current committed HEAD
-**Status:** Codex 入口、Word 字符级修订批注、PDF 高亮批注均已实现并完成专项验收；2026-08-06 追加 altChunk 原生支持、V3 报告、性能优化，全部已提交。
+**Branch / HEAD:** `main` / `f20ee89`（DeepSeek thinking-disabled 已提交）
+**Status:** 工作树有一批 failover 改造未提交；skill 改造（publish/political → WorkBuddy）待下次。
 
-> 工作树原有 `.workbuddy/memory/2026-08-05.md` 用户修改。本次实现没有编辑该文件，后续提交时不要把它当成本次产物覆盖或回退。
+---
 
-## 2026-08-06 技术更新（本日新增）
+## 当前工作树状态（未提交）
 
-### altChunk（PDF→Word / 腾讯文档）DOCX 原生支持
+以下 failover 改造已完成并通过全量回归（151 项 + 固定样本），**尚未提交**：
 
-问题：PDF→Word 转换器和腾讯文档导出的 `.docx` 正文是单个 `<w:altChunk>`
-（无标准 `w:p`），全文嵌在 `word/*.mht` 里。此前 DOCX→MD 产出空文本、P-map
-为空、写回静默跳过——纯 Word 稿件正常，altChunk 格式整条管线失效。
+| 文件 | 改动 |
+|------|------|
+| `src/proofreader.py` | `_MODEL_PARAMS` 每模型参数块（thinking-disabled / response_format / temperature=None）；`_client_config` 扩展 4 provider（DeepSeek 直连、阿里云 dashscope、Moonshot、智谱）；`deepseek_async` 加 `models` 列表 failover 循环 + `provider_failovers` 统计 |
+| `src/max_pipeline.py` | 输出契约 `{"findings":[...]}` 对象包装（`_json_extract` 语义反转）；checkpoint identity 剥离 `model` 键（跨 provider 共享）；`run_max`/`phase1`/`worker` 透传 `models` |
+| `src/resource/prompt-proofreader-system-outputJSON.xml` | `<EXAMPLE_JSON_OUTPUT>` 改为 `{"findings":[...]}` 包装 |
+| `src/cli.py` | `AVAILABLE_MODELS` 加 `qwen3.8-max`/`kimi-k2.6`/`glm-4.7`；max 子命令加 `--failover-models` |
+| `tests/test_network_resume.py` | identity 去 model；新增 findings 对象 / failover 切换 / 单模型用例 |
+| `tests/test_skip_visibility.py` | fake_json 改对象契约 |
+| `CLAUDE.md` / `README.md` | 契约 + failover 文档 |
 
-修复（`src/extract_source.py`，commit `6006c75` + `5f42b38`）：
+**验证**：全量 `unittest` 151 项绿、固定样本 `validate_synthetic.py` 精确命中、`compileall` + `git diff --check` 通过；真实 DeepSeek smoke（新对象契约）2.6s 成功返回 `{"findings":[...]}`。
 
-- `extract_altchunk_paragraphs(archive)`：健壮 MHT 解码（multipart 边界 →
-  `Content-Type: text/html` 段 → quoted-printable / base64 → 声明字符集 GBK/
-  UTF-8）+ HTML→段落（含标题层级）。
-- `materialize_altchunk_paragraphs(body, paras)`：物化为标准 `w:p` 供引擎回写。
-- `docx_uses_altchunk_body(archive)`：**共享判定**——三消费方（extract_docx_units、
-  `_build_para_text_map`、writeback_engine.main）用它决定「正文是否完全由 MHT 承载」。
-  忽略空 `<w:p/>` 占位，要求有文本承载才退回标准 walk；混合文档三处一致走标准
-  walk，altChunk 内容不静默丢弃、不重排。
-- 对抗性审查（4-agent 工作流）修复了守卫漂移、顶层 import 崩溃、缺 rels part
-  KeyError、base64/GBK 解码。
+> 注：`.workbuddy/memory/2026-08-10.md` 为 untracked（用户 WorkBuddy 记录），提交时保留不误动。
 
-P 编号三消费方逐段一致（1044 段字节级校验通过）。效果：**无需 LibreOffice 中转**，
-`proofread m my.docx --writeback` 直接产出完整修订+批注的 `_审阅版.docx`（实测 1543
-字符级修订 + 1598 批注，OOXML 审计通过，LibreOffice 打开正常）。
+---
 
-### V3 深色主题审校报告（`src/html_report_v3.py`）
+## 关键洞察（2026-08-10，重要，可复用）
 
-替代旧版表格视图：深色主题、统计卡片（必须修改/建议修改/供参考）、按 Markdown
-标题自动分组、**原文内嵌红色高亮错误词**（location 定位上下文）、绿色建议、说明。
-`max_pipeline.phase4_report` 委托给它，输出仍为 `{doc}_max_report.html`。
+### 1. DeepSeek V4 thinking 默认开启 → JSON 截断/空响应（已修，已提交 `f20ee89`）
 
-### 性能优化（长稿 token 能效）
+- **OpenAI 端点**：`thinking` 默认 ON，把输出预算烧在内部推理上，负载高时 JSON 截断或空响应。A/B 实测：默认成功率 **40%**（2/5，失败时 max_tokens 打满 512），显式 `thinking:{type:disabled}` 后 **100%**（5/5，输出 tokens 降到 ~1/6，耗时减半）。
+- **修复**：`_deepseek_request_once` 对 `deepseek-v4-flash/v4-pro` 传 `extra_body={"thinking":{"type":"disabled"}}`。
+- **Anthropic 端点**（Claude Code agent 走的 `/anthropic/v1/messages`）：同样 thinking 默认 ON（已探测 `content_types=['thinking','text']`），且 **`settings.json` 只能映射 URL/model、无法传 thinking 参数** → publish/political 的 Claude agent 享受不到此修复。
 
-实测 16 万字书稿 Phase 1 耗时 11321s（≈3h），token 约 235 万，成本约 ¥5。
-瓶颈：模型推理和分块调用数量仍是主耗时；默认并发 3 + rpm 15 保守限流。max 现在使用本地 context 裁剪、共享 client/线程池、300 秒超时、显式重试和按源哈希绑定的原子 checkpoint。
+### 2. 三个审校项目架构不同，ai-proofread 的修复无法直接迁移
 
-优化（commit `3cb922a` + `67c143e`）：
-- `max_tokens=4096`（仅 JSON 发现模式）。
-- `splitter.build_local_context()`：context 裁剪为章节标题 + target 前后各 800 字
-  （上限 3000），token 降 38%。
-- `cut_text_by_length()`：无空行连续文本按句子边界（`。！？；…`）硬切，不退化超大块。
-- 安全默认保持 `--concurrent 3 --rpm 15 --chunk-size 200`。在固定 120 段样本通过召回/精确率门禁前，不提高并发/RPM，也不改变默认分块。
-- max 第二次运行只补失败或 hash 不匹配的块；合法 `issues: []` 计为完成。阶段统计记录调用、重试、限速等待、checkpoint 命中和 wall time。
-- 新增 `tests/test_splitter_context.py`。
+| 项目 | 类型 | LLM 调用方式 |
+|------|------|-------------|
+| **ai-proofread** | Python 包（`proofread` CLI） | 直连 OpenAI 端点（已修 thinking/failover） |
+| **proofreading-publish** | Claude Code skill 项目 | agent dispatch（`sonnet/haiku/opus` → 全局 settings → DeepSeek Anthropic 端点，thinking 开） |
+| **proofreading-political** | Claude Code skill 项目 | 同上 |
 
-### 跳过发现可见性 + book 路径可靠性 + 固定样本（2026-08-06 晚）
+- publish/political **无自己的 LLM API 调用代码**，不 import ai-proofread。它们的 agent 走全局 `~/.claude/settings.json` 的 `ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic` + `ANTHROPIC_DEFAULT_*_MODEL=deepseek-v4-*`。
+- **结论**：要修 publish/political 的 thinking/稳定性，不能靠迁移 ai-proofread 代码；需在 agent 编排层或调用架构上解决（见下次待办）。
 
-针对 Codex 性能诊断文档的专项整改（Layer A/B 静默丢弃、book 路径 O(N²)）：
+### 3. WorkBuddy 不识别 `.claude/skills/`，需独立 agent 定义
 
-- **跳过发现可见性**：`phase1_json_proofread` 统计 `findings_from_llm` /
-  `dropped_match`；`_resolve_findings_to_p` 新增 `skip_log` 参数记录丢弃原因
-  （`duplicate_anchor` / `fuzzy_tie` / `p_out_of_range` / `explicit_p_not_found` /
-  `not_found` / `empty_key_text`）。`run_max` 把 Layer A + B 丢弃统一原子落盘
-  `{doc}_skipped.json`（`ai-proofread.skipped.v1`），V3 报告顶部显示被跳过横幅。
-  被丢弃的发现不再静默消失。
-- **book 路径可靠性**（`process_paragraphs_async`）：每段独立侧车原子 checkpoint
-  （`{out}.chunks/{i:06d}.json`，O(1) 写，去掉整份 JSON 读改写的 O(N²) 与全局锁）；
-  失败段记 `*.error.json`；结束时若有失败抛 `RuntimeError`（CLI 非零退出）；重跑
-  只补缺失段；提示生产改用 `proofread max`。
-- **新增测试**：`tests/test_skip_visibility.py`（5 例）、`tests/test_book_path.py`（3 例）。
-- **可复用固定样本**：`samples/审校合成稿.md`（1806 字，确定性错误 TGSCC 64 /
-  异形词 5 / 结构 2 + 五类 LLM 陷阱：边界、跨段指代、需上下文事实、重复锚点、
-  同形异义词）+ `samples/审校合成稿_错误清单.md`（参考答案与复测方法）+
-  `samples/validate_synthetic.py`（确定性阶段秒级回归）。
-- **结构检查器全面重写（commit 待提交，多轮对抗验证闭环）**：
-  - `scanner.py` 不再全文正则扫描（正文"在第二章中/12.9亿"不再误报），改为识别
-    markdown 标题：ATX `#`（可无空格/全角空格/BOM 容忍）、setext `===`、无 `#`
-    的"第X章 标题"普通行行首锚定 + 编号后空白；跳过代码围栏。
-  - 建树以 markdown 标题层级（`#` 数量）优先：`## 1.` 按 H2 编号节不再误报
-    hierarchy_gap；真跳级 H1→H3 仍报；setext 标题文本行以 heading_level=1 参与。
-  - 合并标题「第1章 第1节」取全编号（含紧凑 `第1章第1节`、普通行、`第1.`前缀）；
-    叙述性提及（第二章的比较/参考文献「第2章」/第一节的比较）被排除；同一标题行
-    的章+节按 line_id 同层嵌套，跨行同号仅当前后都带节行且节号连续才合法。
-  - 全角归一化：全角数字/句点/拉丁、繁體節、Unicode 罗马（Ⅻ→XII）、小写 iv
-    均归一化命中且偏移映射回原文；装饰前缀支持全角数字（第１部分）。
-  - 罗马严格判定：非法序列（IIX/VX/IIII）→ number_missing；`第X章` 草稿占位在
-    混合体系中判 number_missing；`第I章`=1 等合法罗马不误伤；编号体系切换
-    （罗马前言→阿拉伯正文）不比较连续性。节级罗马（第IV节）规则已支持。
-  - 三/四轮对抗验证（召回/精度/一致性 + 复验）累计发现并修复 30+ 项边界；
-    回归测试 `tests/test_structure_scanner.py`（68 例），全量 140 项通过；
-    合成稿确定性仍精确 64/5/2。
-- **结构检查器覆盖 6 类标题体系（commit 待提交）**：`rules.example.json` 新增
-  `part`（部/编/卷/篇/册，`第一部/第1卷/卷一`）、`cn_item`（一、）、`paren_cn`
-  （（一）/半角）、`ar_punct`（1、）、`num_dot`（1.1 按点数定级，量词/年份排除）、
-  `special`（前言/附录A/后记 等词边界 + 编号后缀）。scanner 两遍匹配（剥离装饰 →
-  保括号序号），part 前缀合并标题总是补 part；builder 同号同单位 part 合并 +
-  卷号变化切分（部内章重启、卷内节跳号均正确）、part 吸收后续节点（卷→节）、
-  柔性小节（一、/（一））纯文本不报 gap。对抗验证 3 轮累计闭环 20+ 项（含 part
-  边界重置、卷一丢章、同号 part 跨单位、纯文本序号不可见等）。11 种真实书稿结构
-  穷举验证通过。已知权衡：num_dot 无法区分多级编号与月日/小数（5.1、3.14）。
+- WorkBuddy 用自己格式（`.workbuddy/agents/`、`~/.workbuddy/skills/`、marketplace），app 不引用 `.claude/skills/`。
+- **已有先例**：ai-proofread 的 `.workbuddy/agents/pdf-proofreader.md`（frontmatter: `name/description/model/tools/color` + 正文指令）驱动 `proofread` CLI 做 PDF 审校。
+- 因此让 publish/political 可被 WorkBuddy 使用 = 各写一个 `.workbuddy/agents/` 定义，复用其确定性脚本 + 规则库，agent 编排用 WorkBuddy 替代 Claude dispatch。
 
-## Goal
+---
 
-让 Codex 在本仓库内自动发现中文审校工作流，并使用项目自身的确定性工具完成：
+## 下次待办：publish/political → WorkBuddy skill 改造
 
-- `.docx`：字符级 Word 修订（`w:del/w:ins`）及标准批注。
-- 带文字层 `.pdf`：在原版式 PDF 上写入标准 Highlight 高亮及弹窗批注。
-- 两种审校来源：现有 DeepSeek max 流水线，或 Codex 原生审校并联网核验事实。
+**目标**：让 proofreading-publish / proofreading-political 可被 WorkBuddy 使用（用户 2026-08-10 提出，确认下次做）。CLI 网关方案已搁置。
 
-不依赖 OfficeCLI、docx-mcp、Adeu 或其他 MCP。原文件始终只读。
+### 两个项目的确定性资产（可复用）
 
-## Codex Entry
+- **publish**（最大，~22K LOC）：25 个 Python 脚本——`extract_text`/`chunk_text`/`scan_known_errors`/`merge_results`/`apply_corrections_*`/`generate_report` 等；`run_pipeline.sh` 主入口；错例库 `references/knowledge_base/cases.jsonl`。仅 `dispatch_agents.py` 依赖 Claude `Agent` 工具。
+- **political**（~4.4K LOC）：`scan_political.py` 确定性关键词扫描 + `references/*.md` 规则库 + 少量 agent workflow（`online-review.js`）。
 
-- `AGENTS.md`：仓库级自动路由和安全门禁。
-- `.agents/skills/ai-proofread/SKILL.md`：项目级 `$ai-proofread` Skill。
-- `.agents/skills/ai-proofread/agents/openai.yaml`：Codex Skills UI 元数据。
+### 改造要点
 
-模式：
+1. 各写 `.workbuddy/agents/publish-proofreader.md` / `political-proofreader.md`（参考 ai-proofread 的 `pdf-proofreader.md` 格式）。
+2. 驱动确定性脚本（extract → chunk → scan → merge → writeback → report），agent 编排用 WorkBuddy 替代 Claude dispatch。
+3. publish 的 `dispatch_agents.py`（Claude `Agent` 依赖）是主要改造点。
+4. 优先跑确定性扫描（不依赖 DeepSeek），LLM 环节走 WorkBuddy 自身模型通道。
 
-| 模式 | 审校发现来源 | 写回后端 |
-|---|---|---|
-| `pipeline`（默认） | `proofread max` / DeepSeek | 02 OOXML / PyMuPDF |
-| `codex-native` | Codex 按项目规则生成 findings；事实项可联网核验 | 同上 |
+### 已知待验证
 
-DeepSeek API 调用不等于实时联网检索。需要事实来源时必须使用 `codex-native`，并记录实际访问的权威网页。
+- WorkBuddy agent 协议细节（字段、工具白名单）以现有 `pdf-proofreader.md` 为准，不确定处查 WorkBuddy 文档。
+- publish 错例库路径是相对路径，WorkBuddy agent 需在正确 CWD 下驱动。
 
-长稿 codex-native 以连续 P/页码分批（每批最多 40 units，约不超过 12,000
-非空白字符），保存批次 findings 和覆盖 checkpoint；合并去重前必须证明
-`review_source.json` 的每个 unit 恰好覆盖一次。
+---
 
-## Public Interfaces
+## 项目核心事实（保持不变，后续工作需遵守）
+
+### CLI 命令（项目根）
 
 ```zsh
-# 生成带稳定位置和源文件哈希的 Codex 审校源
-proofread extract <source.docx|source.pdf> --out <review_source.json>
-
-# Word findings 写回
-proofread w <source.docx> --findings <findings.json> [--source-manifest <review_source.json>] --out <review.docx> --author "Codex审校"
-
-# PDF 安全预览与正式写回
-python3 src/pdf_pipeline.py pdf2md <source.pdf> --out <review.md>
-proofread m <review.md> --no-view
-python3 src/pdf_pipeline.py annotate <source.pdf> <findings.json> --source-manifest <review_source.json> --dry-run --csv <preview.csv>
-python3 src/pdf_pipeline.py annotate <source.pdf> <findings.json> --source-manifest <review_source.json> --out <review.pdf> --csv <annotations.csv>
+proofread p  <file.md|docx>              # 单文件全量重写
+proofread b  <file.md|docx>              # 全书（split + async）
+proofread m  <file.md|docx>              # ★ max 管线（全部阶段，见 CLAUDE.md）
+proofread w  <file.docx>                 # DOCX 修订+批注写回（02 引擎）
+proofread x  <file.docx|pdf>             # 位置保留源导出（Codex）
+proofread d  <original.md> <proofed.md>  # HTML 词级 diff
+proofread s  <file.md>                   # TGSCC 汉字规范检查
 ```
 
-`ai-proofread.source.v1` 包含 `source_sha256`，Word 单元使用 `P<n>`，PDF 单元使用一基页码。
+### 关键约束
 
-`ai-proofread.findings.v1` 的规范数组字段为 `issues`，每条包含：
+- **P 编号一致性**：`writeback_engine._para_raw_text()` 与 `max_pipeline._build_para_text_map()` 必须逐字节一致，勿重构为共享函数（唯一例外 altChunk 判定 `extract_source.docx_uses_altchunk_body`）。
+- **两个 system prompt 勿互换**：`prompt-proofreader-system.xml`（全文重写，`proofread p/b`）vs `prompt-proofreader-system-outputJSON.xml`（JSON 发现，max Phase 1）。
+- **Python ≥ 3.10**（`str | None` 语法）。无 pytest，新回归用 `unittest`。
+- **源文件只读**；DOCX/PDF 写回必须先过哈希门禁 / `--dry-run`。
 
-```json
-{
-  "fix_class": "must_fix|polish|verify",
-  "current": "原文",
-  "suggested": "建议文本",
-  "reason": "理由",
-  "category": "类别",
-  "location": "P3",
-  "page": 2,
-  "evidence": [{"title": "来源", "url": "https://...", "accessed_at": "YYYY-MM-DD"}]
-}
-```
+### 数据依赖
 
-Word 使用 `location`，PDF 必须使用一基整数 `page`。`findings` 数组名仅作为兼容别名保留；若 `issues` 同时存在则以规范字段为准。v1 缺少必填字段/哈希、证据不完整、哈希不符或任何输出路径覆盖源文件时必须失败。legacy Word/PDF findings 均需通过 `--source-manifest` 绑定原文件。
+- TGSCC：`src/resource/tgscc_data.json`；词形：`reliable-proofreading-data/`；MDict（`--names`）；结构规则 `src/structure_checker/rules.example.json`。
 
-## Word Engine
-
-`src/writeback_engine.py` 现在：
-
-- 把 `commentReference` 放进带 `CommentReference` 样式的 `w:r`。
-- 只拆分命中的直接文本 run；保留未命中格式、表格、超链接和既有修订。
-- 对超链接、字段、制表符/绘图、内容控件、既有修订或重复锚点不强改，降级为待核批注。
-- 显式 P 位置不再跨段回退；模糊定位只批注，短锚点扩写受新增字符和长度振幅门禁约束。
-- 保留既有 `commentsExtended.xml` 条目及状态，只追加新 commentEx。
-- 合并而不是覆盖 `settings.xml` 已有 `mc:Ignorable` token。
-- 写临时包后审计所有 XML、关系目标、Content Types、批注 ID 和修订作者，再原子替换输出。
-- 每次写回在隔离目录装载 findings，旧 results 不会串入；`proofread w --out` 已真正生效，空发现或子进程失败不会覆盖已有审阅版。
-- 源 DOCX 先复制到哈希校验快照，输出也先留在隔离目录；交付前再次核对原路径，避免审校期间换稿和 symlink 覆盖。
-
-Word max 在审校前记录源 DOCX 哈希并写入 `_max_results.json`，Phase 5 前再次核对；专名 findings 现在包含在保存结果和写回集合中，零发现也会原子覆盖旧 JSON。
-
-DOCX→Markdown 和 `proofread extract` 都按正文/表格实际顺序输出，P 编号与 02 引擎一致。
-
-altChunk（内嵌 MHT）docx：引擎在 `docx_uses_altchunk_body` 判定为真时物化 altChunk
-为 `w:p` 再 walk——P 编号与 `extract_docx_units` / `_build_para_text_map` 逐段一致。
-
-## PDF Engine
-
-`src/pdf_pipeline.py` 现在：
-
-- `pdf2md` 逐页按原文字元保留率比较 pymupdf4llm 与 PyMuPDF raw text，而不是只比较长度；覆盖率低于 75% 时自动采用完整 raw text，避免等长错误内容掩盖漏字。
-- `annotate` 使用 `rawdict` 字符 bbox 生成逐行 quads，不再把多行/双栏合并成大矩形。
-- 枚举全部 exact；重复原文必须由 `page` 唯一消歧，否则为 `ambiguous`。
-- fragment/fuzzy 默认只进入 preview；仅显式 `--allow-fragment` / `--allow-fuzzy` 才写入；fuzzy 并列候选即使允许也保持 `ambiguous`。
-- 严格校验 `ai-proofread.findings.v1`，并用 `--source-manifest` 给 legacy max 结果提供审校期间哈希门禁。
-- CSV 记录状态、方法、真实分数、候选页、quad 数和原因；PDF 先写临时文件，重开验证注释类型、作者、内容、页码和 quad 后再原子替换目标。
-- PDF 定位始终读取已校验的临时快照，定位后和正式交付前再次核对原路径哈希。
-
-## Verification Evidence
-
-### Focused regression suite
+### 测试
 
 ```zsh
-python3 -m unittest \
-  tests.test_extract_source \
-  tests.test_codex_entry \
-  tests.test_pdf_pipeline \
-  tests.test_word_writeback \
-  tests.test_altchunk \
-  tests.test_splitter_context
+python3 -m unittest tests.test_network_resume tests.test_skip_visibility  # 本次改动相关
+python3 samples/validate_synthetic.py   # 固定样本确定性回归（秒级）
 ```
-
-- 57/57 tests passed（39 原专项 + 11 altChunk + 7 splitter context）。
-- Skill `quick_validate.py` passed。
-- fresh `codex exec --ephemeral -s read-only` 自动识别 `$ai-proofread`、默认 `pipeline`、02 引擎和源文件只读约束。
-- `python3 -m compileall`、`git diff --check` passed。
-
-### Codex-native Word test
-
-- 合成文档：多 run 格式、表格、事实错误和润色项。
-- 使用 [NASA Moon Facts](https://science.nasa.gov/moon/facts/) 实际联网核验，来源 URL 成功进入 Word 批注。
-- 写回结果：1 个字符级替换、2 条批注、2 个 revision nodes。
-- `python-docx` 重开、ZIP/XML/关系审计、LibreOffice 转 PDF及页面渲染均通过。
-- 源 SHA-256 保持 `e7407675860f915a8531375b969e847da1b81be37b7f86ff9b82200f37a151a5`。
-- 可检查产物：`/Users/kicker114/Downloads/月球事实测试_Codex审阅版.docx`。
-- Word 产物 SHA-256：`203bb93eb52c5ca6c8593d34d71ae9f726a2435485cdef0cc4482b9db8b4a060`。
-
-### Real mixed-layout PDF test
-
-- 输入：`/Users/kicker114/Downloads/月球测试.pdf`，2 页。
-- 源 SHA-256：`5f6c59ec47619e4303f546e5973817529dcbbba6012ab347266ba98047d54ca3`。
-- pymupdf4llm 原始覆盖率仅 7.4% / 40.7%；自动 fallback 后恢复 1253 个非空白文字字符，生成 3724 字符 Markdown。
-- DeepSeek max 实跑：11 chunks，314 秒；8 条结构发现 + 10 条 LLM 发现。
-- PDF dry-run：6 exact hit / 4 fragment preview / 8 structure skip。
-- 正式安全写回：6 条 findings，生成 6 个 Highlight annotations（第 1 页 3 条，第 2 页 3 条）；4 个 fragment 未自动写入。
-- PyMuPDF 重开校验和两页视觉渲染通过，原 PDF 哈希未变化。
-- 最终产物：`/Users/kicker114/Downloads/月球测试_Codex审阅版.pdf`、`/Users/kicker114/Downloads/月球测试_Codex批注清单.csv`。
-- PDF / CSV 产物 SHA-256：`cef2f6f0497ddbfe747043690b830874eb05d4a5a3c5e877e2be3748cdd8f39d` / `7bd0052c33cc9cc34aa391a67d35314d78809543a12ffa14047cdab4b35ad21a`。
-
-另有合成跨页 PDF 回归：单条 finding 跨两页时生成两组 page-local quads；源文件在定位/交付期间变化时不生成产物。
-
-## Known Limits
-
-- 只支持 `.docx`；旧 `.doc` 需先转换。
-- 纯扫描 PDF 必须先 OCR；混合 PDF 的无文字层页面会列出并跳过。
-- fragment/fuzzy 和无法消歧的重复文本不会默认写入，不能为追求命中率绕过 dry-run。
-- Word 的字段、超链接或既有修订只能安全地整段/整 run 挂待核批注；原文不会被改，但可视批注范围可能宽于目标字符。
-- Google Gemini、Aliyun Bailian、`--names` 本轮未测试。
-- 全量 `unittest discover` 仍有两个既有导入错误：`test_performance.py`、`test_two_stage.py` 引用已移除的 `src.sentence_aligner_simple`。它们不属于本次 Codex/Word/PDF 回归门。
-
-## Files Changed
-
-- Codex：`AGENTS.md`、`.agents/skills/ai-proofread/`。
-- Interfaces：`src/extract_source.py`、`src/cli.py`、`pyproject.toml`。
-- Engines：`src/writeback_engine.py`、`src/max_pipeline.py`、`src/pdf_pipeline.py`。
-- 2026-08-06 新增：`src/html_report_v3.py`（V3 报告）、`src/extract_source.py` altChunk
-  解析器/物化器/共享判定、`src/splitter.py` context 裁剪 + 无空行硬切、
-  `src/proofreader.py` `max_tokens`。
-- 结构检查器：`src/structure_checker/`（scanner 两遍匹配 + 全角归一化 + 6 类标题
-  体系；builder 建树以 heading_level 优先 + part 边界/吸收 + 同号合并；numbering
-  严格罗马/中文序号归一化；rules.example.json 6 类规则 + 节罗马）、
-  `src/max_pipeline.py` 结构阶段消费。
-- Tests：`tests/test_altchunk.py`、`tests/test_splitter_context.py`、
-  `tests/test_network_resume.py`、`tests/test_skip_visibility.py`、
-  `tests/test_book_path.py`、`tests/test_structure_scanner.py`（68 例）。
-- Samples：`samples/审校合成稿.md` + `_错误清单.md` + `validate_synthetic.py`。
-- Docs：`README.md`、`CLAUDE.md`、`HANDOFF.md`、`.workbuddy/agents/pdf-proofreader.md`。
-- 产物：`审校项目标准作业指令示范.docx`（SOP 示范）。
-
-## Next Safe Action
-
-1. 先运行上面的专项回归（`tests/` 下 `test_*`，当前 141 项）。
-2. 检查 `git diff --check` 和 `git status --short`。
-3. 提交时保留用户原有 `.workbuddy/memory/2026-08-05.md` 修改，不回退，也不要误称为本次实现。
-4. 对新的真实稿件始终先生成审校源/哈希；PDF 必须先 dry-run。
-5. 长稿审校用 `--concurrent 8 --rpm 60`（实测提速 5 倍，质量不变）。
-
-## 2026-08-09 技术更新（本日新增：月球之书试点 + proofread max 挂起诊断 + CC 等价适配判定）
-
-### 月球之书试点（p10-11 跨页）
-- 用 DeepSeek `proofread max` 跑《月球之书》THE MOON 跨页 p10-11 试点；3 条必改发现已确认并以字符级 PDF 高亮写回：①"月球表面有6 972个…"空格修正 ②"78% 的部分"空格修正 ③"美国国家航天局 → 美国国家航空航天局"（机构全称）。
-- 注：3 条发现源自 `rebuild_blocks.py`（PyMuPDF 按列重拼语义版块）产出，非 `proofread max` 的 LLM 输出；`proofread max` 本身在本次试点中挂起（见下）。
-
-### proofread max 44 分钟挂起（根因已确诊）
-- 现象：后台任务 `0cQC9N` 跑 `proofread max ... --concurrent 3 --rpm 15 --chunk-size 200`，44+ 分钟仅完成 5 块中 1 块、无 failed checkpoint、进程不退不报错。
-- 根因（CC 等价子 agent 确认）：httpx read timeout 按"距上次收字节"计时，DeepSeek 高负载下 trickle/静默持连接使 300s 超时永不触发；`phase1_json_proofread` 裸 `asyncio.gather` 无 `asyncio.wait_for` 墙钟看门狗 → 单块卡死整段 Phase 1（死锁）。`| tail -40` 仅掩盖 stdout，非致因。
-- 死进程：`0cQC9N` 在 sandbox 命名空间内，shell 的 ps/pkill/pgrep 返回 "operation not permitted"/exit 1，无法从本 shell 杀，须由任务机制回收。
-
-### 部分编辑（已完成 → 见下方「修复已实施」）
-- `src/max_pipeline.py` 的 `phase1_json_proofread` 已加 `request_timeout: float = 180.0` 参数 + docstring（行 628-636）；worker(:697)/asyncio.gather(:717) 尚未包 wait_for；行 637 残留重复 docstring 死字面量（应删）。CC 判定：完成而非回退。
-
-### CC 等价适配判定（入口层无 bug，修复落代码层）
-- 主推 (b)：在 `max_pipeline.py` `worker` 内 `await asyncio.wait_for(_proofread_one_json(...), timeout=request_timeout)`；捕 `TimeoutError` → `result=None` 告警，复用 failed checkpoint 分支（error="墙钟超时 Ns"）→ `run_max` fast-fail 可续跑。
-- 最小集 = b + c：`cli.py` 加 `--request-timeout`（default 180.0）透传 `run_max → phase1`。
-- (a) 辅助：`proofreader.py` `API_TIMEOUT_SECONDS` 300→120。
-- (d) 否定：入口/WorkBuddy skill 层无 bug（`load_dotenv` 正常、传参链完整），是同入口无关的鲁棒性缺口，不在该层修。
-- CC 不挂 ≠ 代码安全：同代码同路径，CC 不挂是 DeepSeek 间歇负载 + 参数差异的抽样运气。
-- VERDICT：只有 `worker` 内 `asyncio.wait_for` 能把无界阻塞变可恢复的失败。
-- 残留风险：`run_in_executor` future 不可取消；`_API_EXECUTOR` 非 daemon，atexit join 卡线程；建议 fast-fail 前 `_API_EXECUTOR.shutdown(wait=False, cancel_futures=True)` + 必要时 `os._exit` 兜底。
-
-### 修复已实施（2026-08-09 晚，Claude Code 落地）
-按最小充分集完成，全部改动在本仓库 `src/` + `tests/`：
-- `max_pipeline.py`：`worker` 内 `asyncio.wait_for(_proofread_one_json(...), timeout=request_timeout)`，捕 `asyncio.TimeoutError` → `result=None` + `api_stats['failures']+=1`，failed checkpoint 写「墙钟超时 Ns」；删行 637 重复 docstring；`run_max` 新增 `request_timeout=180.0` 透传 phase1；fast-fail 前 `_API_EXECUTOR.shutdown(wait=False, cancel_futures=True)`。
-- `cli.py`：`max` 子命令新增 `--request-timeout`（default 180.0，>0 校验）透传 run_max；捕获 `RuntimeError` → flush 后 `os._exit(1)`（规避 `concurrent.futures._python_exit` 无条件 join 泄漏线程导致的退出挂起）。
-- `proofreader.py`：`API_TIMEOUT_SECONDS` 300→120（仅辅助，trickle 下 per-inactivity 超时仍可被无限重置，真正的墙钟看门狗是 wait_for）。
-- `tests/test_network_resume.py`：`timeout=300.0` 断言改为引用常量；新增 `test_wall_clock_timeout_marks_chunk_failed_and_resumes`（模拟永不返回 → 超时记 failed → 续跑只补失败块）。
-- 验证：`tests.test_network_resume` 9/9、专项回归 133 项、固定样本 `validate_synthetic.py` 64/5/2 全过、`compileall` + `git diff --check` 通过；CLI 参数注册、非法值退出码 2、cli→run_max 透传 42.0 均已实测。
-- 待办（不在本次最小集）：`proofread b` 的 `process_paragraphs_async` 与 `chat_google_async` 仍有同类无界阻塞；长期正解是把 `deepseek_async` 热路径迁到 `AsyncOpenAI` 让 wait_for 真正取消连接（消除线程泄漏与 os._exit 需要）。
-
-### 修复后隔离复测（2026-08-09 22:32，task goS3o6）
-- 复测：`timeout 1500 /usr/local/opt/python@3.14/bin/python3.14 -m src.cli max /tmp/moon_test/review_prose.md --no-view --concurrent 3 --rpm 15 --chunk-size 200 --request-timeout 120` → **EXIT=0，墙钟 192s，未挂起**（对比当初 44min 卡死）。日志 `/tmp/moon_test/run.log`。
-- Phase 1 统计：`块=4 失败=2 | API尝试=10 重试=6 空响应=6 JSON无效=0 | 墙钟=192.22s`；最终"✓ 5 条修正"。
-- 结论：**挂死已修复**；但本次未触发 trickle 路径（响应均在 ~40s 内返回，看门狗未 fire，机制就位待真实持连接场景压测）。
-
-### 空响应漏审硬化（已实施，2026-08-09 晚 Claude Code）
-**复测误判纠正**：核实 `/tmp/moon_test/.review_prose_max_checkpoint/c105334c0a026e1cb3ab/` 实际 checkpoint——
-chunk-000000 / chunk-000003 的 status 都是 `failed`、error=`墙钟超时 120s`，**不是**"0 发现 complete"；run.log 也显示
-`run_max` 抛了 RuntimeError、cmd_max 打印"❌ Phase 1 存在失败分块（2 块）"。即：那次复测里 2 块漏审是被**看门狗**
-显式标 failed（failed_chunks=2，exit 应为 1），**并没有静默吞成 0 发现**。HANDOFF 此前"failed_chunks=0/EXIT=0"系误读。
-
-**但"空响应→0 发现"是真实的潜在漏洞，已硬化**：`_json_extract` 用 `find("[")...rfind("]")` 从任意文本抠数组，
-若 DeepSeek 返回 `{"issues": []}` 这类**对象格式**（prompt 要求数组）会被误解析成空数组 → 记"审完 0 发现"→ 静默漏审。
-- `_json_extract` 现在区分格式：文本以 `{` 开头 → 按对象解析，取 issues/changes/findings/corrections 数组；
-  非空 → 救回发现；**键存在但为空 → 返回 None → invalid → failed**（不再被当 0 发现）；无匹配键/解析失败 → None。
-  文本以 `[` 开头 → 规范数组；`[]` 仍是合法干净块（符合 prompt），不被误判失败。
-- `_proofread_one_json` 0 发现打印改为 `审完 0 发现（干净块）`，与失败/超时告警区分。
-- 空响应（None/空串）本就由 `deepseek_async` 重试 3 次 → `None` → failed（既有路径），本次未改其语义。
-- 测试：`tests.test_network_resume` 新增 3 例（对象空 issues → failed；对象非空 issues → 提取；裸 `[]` → complete）。
-- 验证：`tests.test_network_resume` 12/12、全量专项回归 145 项、固定样本 64/5/2、compileall、`git diff --check` 全过。
-- 交付交接文档：`/Users/kicker114/Downloads/HANDOFF.md`（含复测结果、空响应 bug、CC 下一步动作与 Resume Prompt）。
-
-### 复测2：两严重问题均确认修复（2026-08-09 23:05，CC 提交后真实管线）
-- 提交记录：`0e60bd6`(挂死)、`b9492b4`(空响应硬化)、`fee5e43`(A3 writeback ROUTING)、`f7b0b79`(并发默认 3→8)、`86f14f7`(TGSCC 路径)。`tests/test_network_resume` 12/12 通过。
-- 复测2：`/usr/local/opt/python@3.14/bin/python3.14 -m src.cli max /tmp/moon_test2/review_prose.md --concurrent 3 --rpm 15 --chunk-size 200 --request-timeout 120`（全新副本强制重新请求）。
-- 阶段统计：`块=4 失败=3 | API尝试=9 重试=5 空响应=5 JSON无效=1 | 墙钟=120.08s`；`run_max` 抛 RuntimeError → cli `os._exit(1)`（非零退出，非静默成功）。日志 `/tmp/moon_test2/run.log`。
-- checkpoint：chunk-0/2=failed(墙钟超时120s)、chunk-1=failed(API 空/耗尽)、chunk-3=complete(2 条)。
-- **结论**：挂死（看门狗 120s 触发、整段 120s 结束，对比当初 44min）+ 空响应静默漏审（空耗尽标 failed，旧 `✓ 5 条` 静默标记 0 次出现）**均确认消失**。DeepSeek 本次高失败率（4 块仅 1 成）属 API 负载，已由「失败→checkpoint→续跑」兜底，非管线缺陷。两个严重问题无待修项。
+全量专项：`tests.test_extract_source / codex_entry / pdf_pipeline / word_writeback / altchunk / splitter_context / skip_visibility / book_path / structure_scanner / network_resume`（当前 151 项）。

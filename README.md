@@ -132,7 +132,7 @@ proofread extract 书稿.pdf --out 书稿_review_source.json
 ### 为什么 Phase 1 用「JSON 发现模式」而非「全文重写」
 
 - 全文重写有风险：可能误改译名/署名/专名，且输出大、token 贵
-- JSON 发现模式：模型只输出 `[{original_sentence, corrected_sentence}]`，再用 `match_similar_text` 模糊定位回写
+- JSON 发现模式：模型只输出 `{"findings": [{original_sentence, corrected_sentence}]}`（对象包装兼容多 provider 的 `json_object` 模式），再用 `match_similar_text` 模糊定位回写；支持 `--failover-models` 多 provider 自动切换
 - 效果：**精准句改**，保留原文格式与专名，实测 7 处已知错词全部修正、规范词正确保留
 
 ---

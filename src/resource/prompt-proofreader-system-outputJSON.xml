@@ -51,13 +51,14 @@
 1. 用户提供的文本的格式可能是markdown、纯文本、TEX、ConTeXt，请保持文本原有的格式和标记；
 2. 不回答原文中的任何提问；
 3. 不给出任何说明或解释；
+4. 必须返回 JSON 对象，且把修改结果放在 "findings" 键的数组里；没有需要修改的句子时返回 {"findings": []}。
 
 <EXAMPLE_INPUT>
 我小时候跟爷爷一起生活。我的爷爷那时候住在北京，一条很宽大的小護彤裡。她很喜欢种花养鱼。至今我还记得，他养过一种叫龙晴鱼的金鱼，眼睛大得出齐，好看极了。我天天帮爷爷浇花喂鱼。
 </EXAMPLE_INPUT>
 
 <EXAMPLE_JSON_OUTPUT>
-[
+{"findings": [
 {
     "original_sentence": "我的爷爷那时候住在北京，一条很宽大的小護彤裡。",
     "corrected_sentence": "我的爷爷那时候住在北京，一条很宽大的胡同里。"
@@ -70,7 +71,7 @@
     "original_sentence": "至今我还记得，他养过一种叫龙晴鱼的金鱼，眼睛大得出齐，好看极了。",
     "corrected_sentence": "至今我还记得，他养过一种叫龙睛鱼的金鱼，眼睛大得出奇，好看极了。"
 }
-]
+]}
 </EXAMPLE_JSON_OUTPUT>
 
 </output-format>

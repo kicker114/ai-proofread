@@ -43,6 +43,9 @@ AVAILABLE_MODELS = [
     "deepseek-chat",
     "deepseek-reasoner",
     "deepseek-v3",
+    "qwen3.8-max",
+    "kimi-k2.6",
+    "glm-4.7",
 ]
 
 
@@ -335,13 +338,16 @@ def cmd_max(args):
         print("❌ --request-timeout 必须是正数")
         sys.exit(2)
 
+    failover = [m.strip() for m in (args.failover_models or "").split(",")
+                if m.strip()] if getattr(args, "failover_models", None) else None
     try:
         results = run_max(
             args.file, model=args.model, concurrent=args.concurrent,
             rpm=args.rpm, run_names=args.names, verbose=args.verbose,
             writeback=args.writeback, author=args.author,
             chunk_size=args.chunk_size,
-            request_timeout=args.request_timeout)
+            request_timeout=args.request_timeout,
+            failover_models=failover)
     except RuntimeError as exc:
         # Phase 1 存在失败分块：run_max 已保留 checkpoint 并可续跑。这里必须用
         # os._exit 而非 sys.exit——超时放弃的 API 请求线程不可取消，正常退出时
@@ -735,6 +741,9 @@ def main():
                    help="每块目标字数 (默认 200)")
     m.add_argument("--request-timeout", type=float, default=180.0,
                    help="单块墙钟看门狗超时（秒，默认 180）；超时的块记为失败可续跑")
+    m.add_argument("--failover-models", default="",
+                   help="多 provider 备选模型（逗号分隔，如 qwen3.8-max）。主模型重试"
+                        "耗尽后按此顺序自动切换；需对应 provider 的 API key")
     m.add_argument("--names", action="store_true", help="启用专名查词（MDict 词典）")
     m.add_argument("--writeback", action="store_true",
                     help="审校完成后自动回写 DOCX（修订+批注）")

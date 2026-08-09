@@ -185,7 +185,7 @@ The flagship pipeline. Runs in order:
 | 0a | Character spec (TGSCC) | Lookup table — traditional/variant/non-standard chars |
 | 0b | Word-form check | Offline dictionary scan (xh7_compressed + yixingci) |
 | 0c | Structure check | `structure_checker/` — heading hierarchy gaps + numbering continuity |
-| 1 | LLM proofread | DeepSeek JSON discovery mode — chunked async, returns `[{original_sentence, corrected_sentence}]`, then `match_similar_text` fuzzy-locates and writes back. NOT full rewrite — precise sentence-level fixes only |
+| 1 | LLM proofread | LLM JSON discovery mode — chunked async, returns `{"findings": [{original_sentence, corrected_sentence}]}` (object wrapper so multi-provider `json_object` mode can pin structure), then `match_similar_text` fuzzy-locates and writes back. NOT full rewrite — precise sentence-level fixes only. Multi-provider failover: `--failover-models qwen3.8-max,kimi-k2.6,...` switches provider after per-provider retry exhaustion; checkpoint identity excludes model so failed chunks share checkpoints across providers |
 | 2 | Proper-noun check (--names) | LLM identifies proper nouns → `mdict.query_mdx()` dictionary lookup |
 | 3 | Sentence alignment | Anchor algorithm + Jaccard n-gram (`sentence_aligner.py`) |
 | 4 | Master report | Aggregates all phases into single self-contained HTML (`html_report_v2.py`) |

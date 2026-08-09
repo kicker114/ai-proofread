@@ -20,14 +20,14 @@ class LayerASkipVisibilityTests(unittest.IsolatedAsyncioTestCase):
         chunk = {"target": "第一句话完全正常的内容需要修改。第二句也是正文。",
                  "context": ""}
         # 1 条有效修正 + 1 条原句=改句 + 1 条匹配率过低（26 < 60）
-        fake_json = json.dumps([
+        fake_json = json.dumps({"findings": [
             {"original_sentence": "需要修改",
              "corrected_sentence": "需要修正"},
             {"original_sentence": "需要修改",
              "corrected_sentence": "需要修改"},
             {"original_sentence": "完全不相关的别处文字zzz",
              "corrected_sentence": "改成别的"},
-        ], ensure_ascii=False)
+        ]}, ensure_ascii=False)
 
         async def fake_deepseek(*_args, **_kwargs):
             return fake_json
