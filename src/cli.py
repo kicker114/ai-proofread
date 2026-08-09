@@ -331,12 +331,26 @@ def cmd_max(args):
     if args.chunk_size <= 0:
         print("❌ --chunk-size 必须是正整数")
         sys.exit(2)
+    if args.request_timeout <= 0:
+        print("❌ --request-timeout 必须是正数")
+        sys.exit(2)
 
-    results = run_max(
-        args.file, model=args.model, concurrent=args.concurrent,
-        rpm=args.rpm, run_names=args.names, verbose=args.verbose,
-        writeback=args.writeback, author=args.author,
-        chunk_size=args.chunk_size)
+    try:
+        results = run_max(
+            args.file, model=args.model, concurrent=args.concurrent,
+            rpm=args.rpm, run_names=args.names, verbose=args.verbose,
+            writeback=args.writeback, author=args.author,
+            chunk_size=args.chunk_size,
+            request_timeout=args.request_timeout)
+    except RuntimeError as exc:
+        # Phase 1 存在失败分块：run_max 已保留 checkpoint 并可续跑。这里必须用
+        # os._exit 而非 sys.exit——超时放弃的 API 请求线程不可取消，正常退出时
+        # concurrent.futures._python_exit 会无条件 join 它们，把进程卡在退出阶段
+        # （症状与原始挂起相同）。flush 后强制结束，非零退出码供外层重试判断。
+        print(f"❌ {exc}", file=sys.stderr)
+        sys.stderr.flush()
+        sys.stdout.flush()
+        os._exit(1)
 
     # 自动打开 master 报告
     if not args.no_view and results.get("report_path"):
@@ -719,6 +733,8 @@ def main():
     m.add_argument("--rpm", type=int, default=15, help="API 速率限制 (默认 15)")
     m.add_argument("--chunk-size", type=int, default=200,
                    help="每块目标字数 (默认 200)")
+    m.add_argument("--request-timeout", type=float, default=180.0,
+                   help="单块墙钟看门狗超时（秒，默认 180）；超时的块记为失败可续跑")
     m.add_argument("--names", action="store_true", help="启用专名查词（MDict 词典）")
     m.add_argument("--writeback", action="store_true",
                     help="审校完成后自动回写 DOCX（修订+批注）")

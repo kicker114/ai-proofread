@@ -36,7 +36,7 @@ proofread d  <original.md> <proofed.md>  # HTML word-level diff
 proofread s  <file.md>                   # TGSCC Chinese character spec check
 ```
 
-Key flags: `--model` (default `deepseek-v4-flash`), `--concurrent N` (LLM concurrency, default 8), `--rpm N` (API rate limit), `--chunk-size N` (max target size, default 200), `--names` (max mode proper-noun dictionary lookup), `--writeback` (max mode auto-writeback to DOCX).
+Key flags: `--model` (default `deepseek-v4-flash`), `--concurrent N` (LLM concurrency, default 8), `--rpm N` (API rate limit), `--chunk-size N` (max target size, default 200), `--request-timeout N` (max-mode per-chunk wall-clock watchdog in seconds, default 180), `--names` (max mode proper-noun dictionary lookup), `--writeback` (max mode auto-writeback to DOCX).
 
 ## Codex project entry (Word + PDF)
 
@@ -280,8 +280,16 @@ proofread m 书稿.md --no-view --concurrent 3 --rpm 15 --chunk-size 200
 - Each max chunk is atomically checkpointed under `.<doc>_max_checkpoint/`; the
   identity includes source hash, model, prompt hash, chunk-size and chunk hash.
 - API retries are explicit and observable: SDK retries are disabled, timeout is
-  300 seconds, and each logical request has at most two retries. Empty or invalid
-  JSON responses are failures, not successful empty reviews.
+  `API_TIMEOUT_SECONDS` (120s, per-inactivity — a trickling server can reset it
+  indefinitely), and each logical request has at most two retries. Empty or
+  invalid JSON responses are failures, not successful empty reviews.
+- Phase 1 has a wall-clock watchdog per chunk: `worker` wraps the API call in
+  `asyncio.wait_for(..., timeout=request_timeout)` (default 180s, override with
+  `--request-timeout N`). A chunk that never returns is marked `failed`
+  (checkpoint error "墙钟超时 Ns") and the run fast-fails with a resumable
+  checkpoint instead of hanging forever; `cmd_max` then exits via `os._exit(1)`
+  because timed-out executor threads cannot be cancelled and would otherwise
+  block interpreter exit.
 - The max report includes phase wall time, logical calls, attempts, retries, rate-limit
   waits and checkpoint hits. A second run should produce zero API calls for completed chunks.
 

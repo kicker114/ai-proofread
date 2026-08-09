@@ -29,7 +29,7 @@ SYSTEM_PROMPT = ""
 with open(PROMPT_FILE_PATH, "r", encoding="utf-8") as file:
     SYSTEM_PROMPT = file.read()
 
-API_TIMEOUT_SECONDS = 300.0
+API_TIMEOUT_SECONDS = 120.0
 API_MAX_ATTEMPTS = 3  # Initial request plus two explicit retries.
 API_RETRY_DELAYS = (5.0, 8.0)
 

@@ -624,8 +624,16 @@ async def phase1_json_proofread(
         concurrent: int = 3, rpm: int = 15,
         checkpoint_root: str | Path | None = None,
         checkpoint_identity: Optional[Dict[str, Any]] = None,
-        system_prompt: Optional[str] = None) -> Dict:
-    """异步并发 JSON 发现模式审校。返回 {findings, refined_chunks}。"""
+        system_prompt: Optional[str] = None,
+        request_timeout: float = 180.0) -> Dict:
+    """异步并发 JSON 发现模式审校。返回 {findings, refined_chunks}。
+
+    request_timeout: 单块墙钟看门狗（秒）。DeepSeek 在高负载下可能「收下请求
+    却不吐响应 / 极慢 trickle」，此时 SDK 的 read timeout（按距上次收字节计时）
+    会被持续重置而不触发；这里改用基于事件循环时钟的 asyncio.wait_for，无论
+    服务端行为如何都会在 request_timeout 后放弃该块并记为 failed，避免整段
+    Phase 1 永久挂起（见 月球之书 试点：单请求 300s 超时未触发、进程挂死 44min）。
+    """
     from .proofreader import RateLimiter, load_system_prompt
 
     started = time.perf_counter()
@@ -685,16 +693,33 @@ async def phase1_json_proofread(
 
     async def worker(idx: int, chunk: Dict) -> Optional[Dict]:
         async with semaphore:
-            result = await _proofread_one_json(
-                chunk, idx + 1, len(chunks), model, rate_limiter,
-                system_prompt, api_stats,
-            )
+            timed_out = False
+            try:
+                result = await asyncio.wait_for(
+                    _proofread_one_json(
+                        chunk, idx + 1, len(chunks), model, rate_limiter,
+                        system_prompt, api_stats,
+                    ),
+                    timeout=request_timeout,
+                )
+            except asyncio.TimeoutError:
+                timed_out = True
+                api_stats["failures"] += 1
+                result = None
+                print(
+                    f"  ⏱  chunk {idx + 1}/{len(chunks)}: 墙钟超时 "
+                    f"{request_timeout:.0f}s，记为失败（可续跑）",
+                    file=sys.stderr,
+                )
             if run_dir is not None and checkpoint_identity is not None:
                 if result is None:
                     _write_chunk_checkpoint(
                         run_dir, checkpoint_identity, idx,
                         chunk_hashes[idx], "failed",
-                        error="API 返回空、异常耗尽或 JSON 无效",
+                        error=(
+                            f"墙钟超时 {request_timeout:.0f}s" if timed_out
+                            else "API 返回空、异常耗尽或 JSON 无效"
+                        ),
                     )
                 else:
                     _write_chunk_checkpoint(
@@ -918,10 +943,12 @@ def run_max(
         concurrent: int = 3, rpm: int = 15,
         run_names: bool = False, verbose: bool = False,
         writeback: bool = False, author: str = "审校助手",
-        chunk_size: int = 200) -> Dict:
+        chunk_size: int = 200,
+        request_timeout: float = 180.0) -> Dict:
     """执行完整 max 管线。返回各阶段结果与产物路径。
 
     writeback=True 时，审校完成后直接把发现回写到 DOCX（02 引擎，字符级修订+批注）。
+    request_timeout: Phase 1 单块墙钟看门狗（秒），透传给 phase1_json_proofread。
     """
     if chunk_size <= 0:
         raise ValueError("chunk_size 必须是正整数")
@@ -1005,7 +1032,8 @@ def run_max(
         chunks, model=model, concurrent=concurrent, rpm=rpm,
         checkpoint_root=checkpoint_root,
         checkpoint_identity=checkpoint_identity,
-        system_prompt=system_prompt))
+        system_prompt=system_prompt,
+        request_timeout=request_timeout))
     llm = llm_result["findings"]
     refined_text = "\n".join(llm_result["refined_chunks"])
     # Layer A 丢弃（chunk 内定位失败）在 phase1 内收集；Layer B 丢弃（P 段
@@ -1026,9 +1054,18 @@ def run_max(
     stage_stats["phase1"] = phase1_stats
     results["stats"] = stage_stats
     if phase1_stats.get("failed_chunks", 0):
+        # 释放 API 线程池：不再接受新任务。超时放弃的请求线程无法被取消，
+        # 会继续阻塞到 SDK 超时或更久；若在此处正常退出，concurrent.futures
+        # 的 _python_exit 会在进程退出时无条件 join 这些线程导致退出挂起，
+        # 由 CLI 层 flush 后 os._exit 兜底。
+        try:
+            from .proofreader import _API_EXECUTOR
+            _API_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
         raise RuntimeError(
-            "Phase 1 存在失败分块，已保留 checkpoint；"
-            "重新运行同一命令将只补失败块"
+            f"Phase 1 存在失败分块（{phase1_stats.get('failed_chunks')} 块），"
+            "已保留 checkpoint；重新运行同一命令将只补失败块"
         )
 
     # 精修版落盘

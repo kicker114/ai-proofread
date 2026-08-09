@@ -33,7 +33,7 @@ class NetworkRetryTests(unittest.IsolatedAsyncioTestCase):
             api_key=proofreader.os.getenv("DEEPSEEK_API_KEY"),
             base_url="https://api.deepseek.com",
             max_retries=0,
-            timeout=300.0,
+            timeout=proofreader.API_TIMEOUT_SECONDS,
         )
 
     async def test_empty_responses_stop_after_two_observable_retries(self):
@@ -143,6 +143,63 @@ class MaxCheckpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["findings"], [])
         self.assertEqual(result["stats"]["failed_chunks"], 1)
         self.assertEqual(result["stats"]["invalid_json"], 1)
+
+    async def test_wall_clock_timeout_marks_chunk_failed_and_resumes(self):
+        """墙钟看门狗：单块永不返回（模拟 DeepSeek 静默 trickle）时，
+        request_timeout 后记 failed checkpoint，而不是永久挂起；续跑只补失败块。"""
+        chunks = [{"target": "第一段。", "context": ""}]
+        identity = {
+            "source_sha256": "a" * 64,
+            "model": "deepseek-v4-flash",
+            "prompt_sha256": "b" * 64,
+            "chunk_size": 200,
+        }
+
+        async def never_returns(*_args, **_kwargs):
+            await asyncio.Event().wait()  # 永不完成
+
+        with tempfile.TemporaryDirectory() as temp:
+            checkpoint_root = Path(temp) / "checkpoints"
+            with patch("src.proofreader.deepseek_async", new=never_returns):
+                result = await phase1_json_proofread(
+                    chunks, concurrent=1, rpm=100000,
+                    checkpoint_root=checkpoint_root,
+                    checkpoint_identity=identity,
+                    system_prompt="test prompt",
+                    request_timeout=0.5,
+                )
+
+            self.assertEqual(result["findings"], [])
+            self.assertEqual(result["stats"]["failed_chunks"], 1)
+            self.assertEqual(result["stats"]["failures"], 1)
+            run_dir = next(path for path in checkpoint_root.iterdir()
+                           if path.is_dir())
+            record = json.loads(
+                (run_dir / "chunk-000000.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["status"], "failed")
+            self.assertIn("墙钟超时", record["error"])
+
+            # 续跑：同一 checkpoint 根，只补失败块，其余不重复调用 API
+            resumed_calls = 0
+
+            async def complete(*_args, **_kwargs):
+                nonlocal resumed_calls
+                resumed_calls += 1
+                return "[]"
+
+            with patch("src.proofreader.deepseek_async", new=complete):
+                resumed = await phase1_json_proofread(
+                    chunks, concurrent=1, rpm=100000,
+                    checkpoint_root=checkpoint_root,
+                    checkpoint_identity=identity,
+                    system_prompt="test prompt",
+                    request_timeout=5.0,
+                )
+
+            self.assertEqual(resumed_calls, 1)
+            self.assertEqual(resumed["stats"]["failed_chunks"], 0)
+            self.assertEqual(resumed["stats"]["attempted_chunks"], 1)
+            self.assertEqual(resumed["stats"]["checkpoint_hits"], 0)
 
     async def test_interruption_resumes_missing_chunk_and_then_uses_zero_calls(self):
         chunks = [
