@@ -156,6 +156,12 @@ def _deepseek_request_once(model: str, messages: list[dict[str, str]],
     }
     if max_tokens:
         kwargs["max_tokens"] = max_tokens
+    if model in ("deepseek-v4-flash", "deepseek-v4-pro"):
+        # DeepSeek V4 thinking mode 默认开启，把输出预算烧在内部推理上，负载高时
+        # 直接导致 JSON 截断/空响应（实测默认成功率 40%、失败时 max_tokens 打满）。
+        # 显式关闭 thinking 后成功率 100%、输出 tokens 降到 ~1/6。旧 alias
+        # deepseek-chat/reasoner 与 dashscope 的 deepseek-v3 不传该参数。
+        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
     response = client.chat.completions.create(**kwargs)
     return response.choices[0].message.content
 
