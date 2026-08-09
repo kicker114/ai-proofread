@@ -54,14 +54,41 @@ DICT_PATHS = {
 
 
 def _json_extract(text: str) -> Optional[List[Dict]]:
-    """从模型输出中稳健提取 JSON 数组（容忍 ```json 代码块、前后缀文字）。"""
+    """从模型输出中稳健提取 JSON 发现数组。
+
+    规范输出是数组（prompt 要求，见 prompt-proofreader-system-outputJSON.xml）：
+    - 文本以 `[` 开头 → 提取顶层数组；空数组 `[]` 表示"审完无发现"（干净块）。
+    - 文本以 `{` 开头 → 对象格式漂移。尝试取 issues/changes/findings/corrections
+      数组：非空 → 救回有效发现；键存在但为空 → 返回 None（对象格式的空结果不可信，
+      判为 invalid → failed，避免被当成"0 发现"静默漏审）。无匹配键/解析失败 → None。
+    """
     if not text:
         return None
     text = text.strip()
     # 去掉 markdown 代码块围栏
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
-    # 找到第一个 [ 和最后一个 ]
+    text = text.strip()
+    if not text:
+        return None
+    if text.startswith("{"):
+        # 对象格式漂移：模型返回了对象而非数组
+        end = text.rfind("}")
+        if end <= 0:
+            return None
+        try:
+            obj = json.loads(text[:end + 1])
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(obj, dict):
+            return None
+        for key in ("issues", "changes", "findings", "corrections"):
+            val = obj.get(key)
+            if isinstance(val, list):
+                # 空对象数组不可信（返回对象已是漂移）→ 判无效，不走"0 发现"完成
+                return val if val else None
+        return None
+    # 数组格式（规范输出）
     start = text.find("[")
     end = text.rfind("]")
     if start == -1 or end == -1 or end <= start:
@@ -614,7 +641,10 @@ async def _proofread_one_json(
         api_stats["invalid_json"] += 1
         print(f"  ⚠️  chunk {index}/{total}: JSON 无效", file=sys.stderr)
         return None
-    print(f"  ✓ chunk {index}/{total}: 发现 {len(findings)} 条")
+    if findings:
+        print(f"  ✓ chunk {index}/{total}: 发现 {len(findings)} 条")
+    else:
+        print(f"  ✓ chunk {index}/{total}: 审完 0 发现（干净块）")
     # index 用 0-based（供 refined_chunks 回写），显示时已加 1
     return {"index": index - 1, "findings": findings, "chunk_text": target_text}
 

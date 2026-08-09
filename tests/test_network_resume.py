@@ -144,6 +144,93 @@ class MaxCheckpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["stats"]["failed_chunks"], 1)
         self.assertEqual(result["stats"]["invalid_json"], 1)
 
+    async def test_object_format_empty_issues_is_failed_not_clean(self):
+        """对象格式漂移：DeepSeek 返回 {"issues": []}（prompt 要求数组）——
+        空对象结果不可信，必须判为 failed，不能当成"审完 0 发现"静默漏审。"""
+        chunks = [{"target": "第一段。", "context": ""}]
+        identity = {
+            "source_sha256": "a" * 64,
+            "model": "deepseek-v4-flash",
+            "prompt_sha256": "b" * 64,
+            "chunk_size": 200,
+        }
+
+        async def object_format(*_args, **_kwargs):
+            return '{"issues": [], "reviewed": true}'
+
+        with tempfile.TemporaryDirectory() as temp, patch(
+                "src.proofreader.deepseek_async", new=object_format):
+            result = await phase1_json_proofread(
+                chunks, concurrent=1, rpm=100000,
+                checkpoint_root=Path(temp) / "checkpoints",
+                checkpoint_identity=identity,
+                system_prompt="test prompt",
+            )
+
+        self.assertEqual(result["findings"], [])
+        self.assertEqual(result["stats"]["failed_chunks"], 1)
+        self.assertEqual(result["stats"]["invalid_json"], 1)
+
+    async def test_object_format_nonempty_issues_still_extracts(self):
+        """对象格式漂移但带有效发现：应救回发现而非全部丢弃。"""
+        chunks = [{"target": "第一段。", "context": ""}]
+        identity = {
+            "source_sha256": "a" * 64,
+            "model": "deepseek-v4-flash",
+            "prompt_sha256": "b" * 64,
+            "chunk_size": 200,
+        }
+
+        async def object_format(*_args, **_kwargs):
+            return json.dumps({"issues": [{
+                "original_sentence": "第一段。",
+                "corrected_sentence": "第一段改。",
+            }]}, ensure_ascii=False)
+
+        with tempfile.TemporaryDirectory() as temp, patch(
+                "src.proofreader.deepseek_async", new=object_format):
+            result = await phase1_json_proofread(
+                chunks, concurrent=1, rpm=100000,
+                checkpoint_root=Path(temp) / "checkpoints",
+                checkpoint_identity=identity,
+                system_prompt="test prompt",
+            )
+
+        self.assertEqual(result["stats"]["failed_chunks"], 0)
+        self.assertEqual(result["stats"]["invalid_json"], 0)
+        self.assertEqual(len(result["findings"]), 1)
+
+    async def test_bare_empty_array_is_legit_clean_chunk(self):
+        """规范数组格式的干净块（[]）必须保持 complete，不能被误判为失败。"""
+        chunks = [{"target": "完全没问题的段落。", "context": ""}]
+        identity = {
+            "source_sha256": "a" * 64,
+            "model": "deepseek-v4-flash",
+            "prompt_sha256": "b" * 64,
+            "chunk_size": 200,
+        }
+
+        async def clean(*_args, **_kwargs):
+            return "[]"
+
+        with tempfile.TemporaryDirectory() as temp:
+            checkpoint_root = Path(temp) / "checkpoints"
+            with patch("src.proofreader.deepseek_async", new=clean):
+                result = await phase1_json_proofread(
+                    chunks, concurrent=1, rpm=100000,
+                    checkpoint_root=checkpoint_root,
+                    checkpoint_identity=identity,
+                    system_prompt="test prompt",
+                )
+                self.assertEqual(result["stats"]["failed_chunks"], 0)
+                self.assertEqual(result["stats"]["invalid_json"], 0)
+                self.assertEqual(result["findings"], [])
+                run_dir = next(path for path in checkpoint_root.iterdir()
+                               if path.is_dir())
+                record = json.loads(
+                    (run_dir / "chunk-000000.json").read_text(encoding="utf-8"))
+                self.assertEqual(record["status"], "complete")
+
     async def test_wall_clock_timeout_marks_chunk_failed_and_resumes(self):
         """墙钟看门狗：单块永不返回（模拟 DeepSeek 静默 trickle）时，
         request_timeout 后记 failed checkpoint，而不是永久挂起；续跑只补失败块。"""
