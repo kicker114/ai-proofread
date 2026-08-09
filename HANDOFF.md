@@ -326,3 +326,10 @@ chunk-000000 / chunk-000003 的 status 都是 `failed`、error=`墙钟超时 120
 - 测试：`tests.test_network_resume` 新增 3 例（对象空 issues → failed；对象非空 issues → 提取；裸 `[]` → complete）。
 - 验证：`tests.test_network_resume` 12/12、全量专项回归 145 项、固定样本 64/5/2、compileall、`git diff --check` 全过。
 - 交付交接文档：`/Users/kicker114/Downloads/HANDOFF.md`（含复测结果、空响应 bug、CC 下一步动作与 Resume Prompt）。
+
+### 复测2：两严重问题均确认修复（2026-08-09 23:05，CC 提交后真实管线）
+- 提交记录：`0e60bd6`(挂死)、`b9492b4`(空响应硬化)、`fee5e43`(A3 writeback ROUTING)、`f7b0b79`(并发默认 3→8)、`86f14f7`(TGSCC 路径)。`tests/test_network_resume` 12/12 通过。
+- 复测2：`/usr/local/opt/python@3.14/bin/python3.14 -m src.cli max /tmp/moon_test2/review_prose.md --concurrent 3 --rpm 15 --chunk-size 200 --request-timeout 120`（全新副本强制重新请求）。
+- 阶段统计：`块=4 失败=3 | API尝试=9 重试=5 空响应=5 JSON无效=1 | 墙钟=120.08s`；`run_max` 抛 RuntimeError → cli `os._exit(1)`（非零退出，非静默成功）。日志 `/tmp/moon_test2/run.log`。
+- checkpoint：chunk-0/2=failed(墙钟超时120s)、chunk-1=failed(API 空/耗尽)、chunk-3=complete(2 条)。
+- **结论**：挂死（看门狗 120s 触发、整段 120s 结束，对比当初 44min）+ 空响应静默漏审（空耗尽标 failed，旧 `✓ 5 条` 静默标记 0 次出现）**均确认消失**。DeepSeek 本次高失败率（4 块仅 1 成）属 API 负载，已由「失败→checkpoint→续跑」兜底，非管线缺陷。两个严重问题无待修项。
