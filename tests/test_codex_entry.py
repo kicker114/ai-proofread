@@ -8,7 +8,13 @@ from unittest.mock import patch
 
 from docx import Document
 
-from src.max_pipeline import _findings_to_issues, _save_findings, run_max
+from src.max_pipeline import (
+    _findings_to_issues,
+    _save_findings,
+    _trim_trailing_garbage,
+    _whitespace_only,
+    run_max,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -132,6 +138,23 @@ class CodexEntryTests(unittest.TestCase):
         }])
         self.assertEqual(issues[0]["fix_class"], "must_fix")
         self.assertEqual(issues[0]["reason"], "现代汉语词典/异形词表")
+
+    def test_whitespace_only_detects_linebreak_and_space_noise(self):
+        # PDF 折行/空格碎片 → 去空白后相同 → 视为纯空白假阳性
+        self.assertTrue(_whitespace_only("这样\n的场景", "这样的场景"))
+        self.assertTrue(_whitespace_only("（ paisa ）", "（paisa）"))
+        self.assertTrue(_whitespace_only("西部， 5另一个", "西部，5另一个"))
+        # 真正的内容差异 → 不是纯空白
+        self.assertFalse(_whitespace_only("人", "病人会"))
+        self.assertFalse(_whitespace_only("卓越", "杰出"))
+
+    def test_trim_trailing_garbage_strips_ascii_tail(self):
+        # 句末标点后紧跟孤立 ASCII 垃圾 → 剥离
+        self.assertEqual(_trim_trailing_garbage("死去。n\n"), "死去。")
+        self.assertEqual(_trim_trailing_garbage("这会发生！x"), "这会发生！")
+        # 正常英文/数字结尾 → 不误伤
+        self.assertEqual(_trim_trailing_garbage("（paisa）。"), "（paisa）。")
+        self.assertEqual(_trim_trailing_garbage("大约 10 年"), "大约 10 年")
 
 
 if __name__ == "__main__":

@@ -57,6 +57,57 @@ def _raw_text_coverage(raw_text: str, markdown_text: str) -> float:
     return retained / len(raw)
 
 
+# 句末标点：行尾若是这些标点，视为自然段落边界，不参与折行拼接。
+_SENTENCE_END = set("。！？…；：」』】\"'”’")
+# 结构性行前缀：标题 / 分隔线 / 表格 / 引用 / 列表，不参与折行拼接。
+_STRUCT_LINE_RE = re.compile(
+    r"^\s*(?:#{1,6}|\*{3,}|-{3,}|_{3,}|~{3,}|\|+|>|[-\*+]\s|\d+[.、．])"
+)
+
+
+def _is_structural_line(line: str) -> bool:
+    """判断是否结构性行（标题/分隔/表格/引用/列表）。"""
+    return bool(_STRUCT_LINE_RE.match(line))
+
+
+def _normalize_pdf_markdown(text: str) -> str:
+    """把 PDF 提取的 markdown 折行/空格碎片归一化，供 LLM 审校前喂入。
+
+    PDF 文字层把正文逐行切块（`病\\n人`），pymupdf4llm 又把每条视觉行变成
+    markdown ``\\n\\n`` 段落、并在拉丁文两侧塞空格（`（ paisa ）`）。LLM 会把
+    这些排版碎片误当错误去「改」，产生假阳性。这里**只删空白/换行、不改任何
+    非空白字符**，因此 annotate 的「去空白精确匹配」不受影响。
+
+    规则：
+      - 折行拼接：忽略空行，把相邻非空行「上一行非句末标点结尾、且两行皆非
+        结构行」时直接接成一句；句末标点结尾或结构行则保留为段落换行。
+      - 空格收敛：去掉与 CJK 字符/CJK 标点相邻的空格；拉丁词内部空格保留。
+    """
+    # 1) 折行拼接：空行不视为段落边界（pymupdf4llm 每行之间都塞空行）。
+    lines = [ln.strip() for ln in text.split("\n")]
+    out: list[str] = []
+    for ln in lines:
+        if not ln:
+            continue
+        if _is_structural_line(ln):
+            out.append(ln)
+            out.append("")
+            continue
+        if out and out[-1] != "" and out[-1][-1] not in _SENTENCE_END:
+            out[-1] += ln  # 直接拼接，不补空格
+            continue
+        if out and out[-1] != "":
+            out.append("")
+        out.append(ln)
+    joined = "\n".join(out)
+    # 2) 空格收敛：去掉与 CJK 字符/CJK 标点相邻的横向空格（保留换行）。
+    cjk = r"一-鿿　-〿＀-￯"
+    joined = re.sub(rf"(?<=[{cjk}])[ \t　]+|[ \t　]+(?=[{cjk}])", "", joined)
+    # 收尾：折叠连续空行，去首尾空白。
+    joined = re.sub(r"\n{3,}", "\n\n", joined)
+    return joined.strip()
+
+
 def pdf2md(pdf_path: str, out_path: str | None = None,
            coverage_threshold: float = 0.75) -> str:
     """用 pymupdf4llm 把图文混排 PDF 转成 Markdown（标题/段落/表格保留）。
@@ -120,6 +171,10 @@ def pdf2md(pdf_path: str, out_path: str | None = None,
     md_text = "\n\n".join(text for text in selected_pages if text).strip() + "\n"
     if not md_text.strip():
         sys.exit(f"PDF 无可提取文本（可能全为扫描图，需先 OCR）: {src}")
+
+    # 归一化折行/空格碎片（只删空白，不改非空白字符），避免 LLM 把排版
+    # 换行误当校对错误。须在写盘前执行，使下游 max 管线读到连续正文。
+    md_text = _normalize_pdf_markdown(md_text)
 
     if fallback_pages:
         shown = ", ".join(
@@ -370,11 +425,13 @@ def _locate_exact(full_text: str, full_locs, norm_s: str,
             "score": 100.0,
             "reason": f"精确命中 {len(candidates)} 处，需用 page 唯一消歧",
         }
-    _, page_quads = candidates[0]
+    start, page_quads = candidates[0]
     method = "crosspage" if len(page_quads) > 1 else "exact"
     return {
         "status": HIT,
         "method": method,
+        "start": start,
+        "length": len(norm_s),
         "page_quads": page_quads,
         "candidate_pages": _candidate_pages(page_quads),
         "score": 100.0,
@@ -587,12 +644,76 @@ def _parse_page_hint(finding: dict, page_count: int) -> tuple[int | None, str]:
     return page, ""
 
 
+_MERGE_GAP = 2  # 相邻改动间隔 ≤2 个相等字符时合并为一个改动（`人`→`病人会` 不拆碎）
+
+
+def _diff_spans(cur: str, sug: str) -> list[tuple[int, int, str]] | None:
+    """求 cur↔sug 的全部字符级差异区间，返回 [(start, end, replacement), ...]。
+
+    用于把 PDF 批注从「整句引用」缩到「逐处字符级差异」：一句内多处分散改动
+    逐处独立高亮，弹窗只显示 `原「X」→「Y」`。用 SequenceMatcher opcode 逐处
+    切分，并把被 ≤_MERGE_GAP 个相等字符隔开的相邻改动合并（`人`→`病人会` 这类
+    「替换文本包含原文」的插入式改法不会被拆碎成多段）。replacement 为空 =
+    纯删除；start==end = 纯插入（锚定前一字符）。无法字符级定位（无 sug /
+    差异 ≥80% / 句首纯插入无锚点）时返回 None，调用方回退整句。
+    """
+    if not sug or cur == sug:
+        return None
+    n = len(cur)
+    opcodes = SequenceMatcher(None, cur, sug, autojunk=False).get_opcodes()
+
+    def _finalize(fi1, li2, fj1, lj2):
+        start, end = fi1, li2
+        repl = sug[fj1:lj2]
+        if end == start:
+            # 纯插入：锚定前一字符定位；句首插入无锚点 → 无法字符级。
+            if fi1 <= 0:
+                return None
+            start, end = fi1 - 1, fi1
+            repl = cur[start:end] + repl
+        return (start, end, repl)
+
+    spans: list[tuple[int, int, str]] = []
+    total_changed = 0
+    pending = None  # 当前改动组 (fi1, li2, fj1, lj2)
+    gap = 0         # 距上一改动的相等字符数
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag == "equal":
+            if pending is not None:
+                gap += i2 - i1
+            continue
+        if pending is not None and gap <= _MERGE_GAP:
+            fi1, _li2, fj1, _lj2 = pending
+            pending = (fi1, i2, fj1, j2)
+        else:
+            if pending is not None:
+                span = _finalize(*pending)
+                if span is None:
+                    return None
+                spans.append(span)
+            pending = (i1, i2, j1, j2)
+        gap = 0
+        total_changed += max(i2 - i1, j2 - j1)
+    if pending is not None:
+        span = _finalize(*pending)
+        if span is None:
+            return None
+        spans.append(span)
+    if not spans:
+        return None
+    if total_changed * 10 >= n * 8:
+        return None  # 差异覆盖 ≥80% cur，本就是大改，缩小无意义
+    return spans
+
+
 def _annotation_content(finding: dict, original: str,
                         corrected: str, tag: str) -> str:
     """把 findings.v1 的建议、理由、分类和联网证据写入弹窗。"""
     lines = [f"{tag} {original}"]
     if corrected and corrected != original:
         lines.append(f"→ {corrected}")
+    elif original:
+        lines.append("→（删除）")
     category = finding.get("category")
     if isinstance(category, str) and category.strip():
         lines.append(f"分类：{category.strip()}")
@@ -871,17 +992,41 @@ def annotate_pdf(pdf_path: str, findings_path: str,
         # 生成高亮批注（复用已保存的 page 对象，规避 1.27 绑定坑）
         annot_cls = _annot_class(f)
         color, tag = _FIX_STYLE[annot_cls]
-        content = _annotation_content(f, original, corrected, tag)
 
-        for pno, quads in page_quads:
-            page = doc[pno]
-            annot = page.add_highlight_annot(quads)
-            annot.set_info(title=author, content=content)
-            annot.set_colors(stroke=color)
-            annot.update()
-            expected_annots.append((
-                pno, "Highlight", author, content, len(quads)
-            ))
+        # 字符级差异：exact/crosspage 命中时只高亮真正变化的字，弹窗只显
+        # 差异片段（原「X」→「Y」）；一句内多处分散改动逐处独立高亮
+        # （multi-span），避免把一字之改埋进长句。
+        pieces = [(page_quads, original, corrected)]
+        if match_method in ("exact", "crosspage") and "start" in match:
+            spans = _diff_spans(norm_orig, "".join(corrected.split()))
+            if spans is not None:
+                pieces = []
+                for c_start, c_end, repl in spans:
+                    full_start = match["start"] + c_start
+                    full_end = match["start"] + c_end
+                    if full_end <= full_start:
+                        continue
+                    sub_quads = _quads_from_span(
+                        full_locs, full_start, full_end - full_start)
+                    if sub_quads:
+                        pieces.append((
+                            sub_quads, norm_orig[c_start:c_end], repl,
+                        ))
+                if not pieces:
+                    pieces = [(page_quads, original, corrected)]
+
+        for highlight_quads, content_original, content_corrected in pieces:
+            content = _annotation_content(
+                f, content_original, content_corrected, tag)
+            for pno, quads in highlight_quads:
+                page = doc[pno]
+                annot = page.add_highlight_annot(quads)
+                annot.set_info(title=author, content=content)
+                annot.set_colors(stroke=color)
+                annot.update()
+                expected_annots.append((
+                    pno, "Highlight", author, content, len(quads)
+                ))
         applied += 1
 
     if _file_sha256(src) != bound_hash:

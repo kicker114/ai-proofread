@@ -57,6 +57,23 @@ DICT_PATHS = {
 }
 
 
+def _whitespace_only(a: str, b: str) -> bool:
+    """两段文本去掉所有空白后是否相同（折行/空格假阳性判定）。"""
+    return re.sub(r"\s+", "", a) == re.sub(r"\s+", "", b)
+
+
+_SENT_END_TRIM = re.compile(r"([。！？…])\s*[A-Za-z0-9]{1,3}\s*$")
+
+
+def _trim_trailing_garbage(s: str) -> str:
+    """剥掉 corrected_sentence 尾部的孤立 ASCII 垃圾（LLM 输出污染）。
+
+    如 `…死去。n` → `…死去。`。仅当句末标点之后紧跟 ≤3 个 ASCII 字符时
+    剥离，避免误伤以英文/数字正常结尾的句子（`（paisa）`、`10 年`等）。
+    """
+    return _SENT_END_TRIM.sub(r"\1", (s or "").strip())
+
+
 # ── 通用工具 ──────────────────────────────────────────────────────────
 
 
@@ -807,11 +824,20 @@ async def phase1_json_proofread(
         for item in (r["findings"] or []):
             findings_from_llm += 1
             original = (item or {}).get("original_sentence") or ""
-            corrected = (item or {}).get("corrected_sentence") or ""
+            corrected = _trim_trailing_garbage(
+                (item or {}).get("corrected_sentence") or "")
             if not original or not corrected or original == corrected:
                 skipped.append({
                     "reason": "no_op_change",
-                    "detail": "原句为空、改句为空或原句等于改句",
+                    "detail": "原句为空、改句为空（或清洗后为空）或原句等于改句",
+                    "original": original,
+                    "corrected": corrected,
+                })
+                continue
+            if _whitespace_only(original, corrected):
+                skipped.append({
+                    "reason": "whitespace_only_change",
+                    "detail": "原句与改句仅空白差异（折行/空格假阳性），非实质修改",
                     "original": original,
                     "corrected": corrected,
                 })

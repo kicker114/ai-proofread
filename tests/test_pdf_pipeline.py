@@ -535,6 +535,100 @@ class PdfPipelineTest(unittest.TestCase):
                 "phase": "0a_tgscc", "char": "藉", "suggestion": "借",
             }), "tgscc")
 
+    def test_normalize_pdf_markdown_joins_line_breaks_and_collapses_spaces(self):
+        # 句中折行拼接 + 拉丁两侧空格收敛
+        self.assertEqual(
+            pdf_pipeline._normalize_pdf_markdown(
+                "是帕伊萨\n\n（ paisa ）。这个词在哥伦比\n\n亚被用来指原籍。"),
+            "是帕伊萨（paisa）。这个词在哥伦比亚被用来指原籍。")
+        # 句末标点结尾 → 保留段落换行；数字两侧空格收敛
+        self.assertEqual(
+            pdf_pipeline._normalize_pdf_markdown(
+                "不出 10 年就会死去。\n\n\n后来的几个月里，洛佩拉重返农场。"),
+            "不出10年就会死去。\n\n后来的几个月里，洛佩拉重返农场。")
+        # 结构行（分隔线）不参与拼接
+        self.assertEqual(
+            pdf_pipeline._normalize_pdf_markdown(
+                "公派医生。\n\n\n~~~\n\n\n洛佩拉是帕伊萨。"),
+            "公派医生。\n~~~\n\n洛佩拉是帕伊萨。")
+        # 拉丁词内部空格保留（英文书名/术语）
+        self.assertEqual(
+            pdf_pipeline._normalize_pdf_markdown(
+                "阿尔茨海默病 (Alzheimer disease) 是一种病。"),
+            "阿尔茨海默病(Alzheimer disease)是一种病。")
+
+    def test_diff_spans_returns_minimal_char_change(self):
+        # 替换（单处 → 单 span）
+        cur = "圣文森特医院是麦德林卓越的公立大学。"
+        sug = "圣文森特医院是麦德林杰出的公立大学。"
+        spans = pdf_pipeline._diff_spans(cur, sug)
+        self.assertEqual(len(spans), 1)
+        start, end, repl = spans[0]
+        self.assertEqual(cur[start:end], "卓越")
+        self.assertEqual(repl, "杰出")
+        # 插入式改法（人 → 病人会，替换文本包含原文，不拆碎）
+        cur, sug = "人在四十七八岁时发病。", "病人会在四十七八岁时发病。"
+        spans = pdf_pipeline._diff_spans(cur, sug)
+        self.assertEqual(len(spans), 1)
+        start, end, repl = spans[0]
+        self.assertEqual(cur[start:end], "人")
+        self.assertEqual(repl, "病人会")
+        # 纯插入锚定前一字符（自己 → 自己的）
+        cur, sug = "构成属于自己灵魂的一切。", "构成属于自己的灵魂的一切。"
+        spans = pdf_pipeline._diff_spans(cur, sug)
+        self.assertEqual(len(spans), 1)
+        start, end, repl = spans[0]
+        self.assertEqual(cur[start:end], "己")
+        self.assertEqual(repl, "己的")
+        # 纯删除（repl 空）
+        cur, sug = "构成属于自己灵魂的一切。", "构成自己灵魂的一切。"
+        spans = pdf_pipeline._diff_spans(cur, sug)
+        self.assertEqual(len(spans), 1)
+        start, end, repl = spans[0]
+        self.assertEqual(cur[start:end], "属于")
+        self.assertEqual(repl, "")
+        # 句首纯插入 → None（无锚点，回退整句）
+        self.assertIsNone(
+            pdf_pipeline._diff_spans("中的主人公。", "书中的主人公。"))
+        # 整句重排/大改 → None
+        self.assertIsNone(
+            pdf_pipeline._diff_spans(
+                "他的档案写着，病人逃出了医院。",
+                "病人逃出了医院，他的档案写着。"))
+        # 短句全替换（≥80%）→ None
+        self.assertIsNone(pdf_pipeline._diff_spans("卓越", "杰出"))
+
+    def test_diff_spans_splits_multiple_distant_edits(self):
+        # 一句内两处分散改动（可以→能够、疾病→疾病的）→ 两个独立 span
+        cur = ("到目前为止，我们还没有找到可以完全治愈阿尔茨海默病的方法，"
+               "但已经能使用药物延缓整个疾病进程。")
+        sug = ("到目前为止，我们还没有找到能够完全治愈阿尔茨海默病的方法，"
+               "但已经能使用药物延缓整个疾病的进程。")
+        spans = pdf_pipeline._diff_spans(cur, sug)
+        self.assertEqual(len(spans), 2)
+        self.assertEqual([cur[s:e] for s, e, _ in spans], ["可以", "病"])
+        self.assertEqual([r for _, _, r in spans], ["能够", "病的"])
+        # 相邻两处改动（载→录、，→、）→ 两个独立 span
+        cur = "但是这一百多年，却记载了现代医学最漫长，也最艰难的探索。"
+        sug = "但是这一百多年，却记录了现代医学最漫长、也最艰难的探索。"
+        spans = pdf_pipeline._diff_spans(cur, sug)
+        self.assertEqual(len(spans), 2)
+        self.assertEqual([cur[s:e] for s, e, _ in spans], ["载", "，"])
+        self.assertEqual([r for _, _, r in spans], ["录", "、"])
+
+    def test_annotation_content_marks_pure_deletion(self):
+        finding = {"category": "用词"}
+        # 纯删除：corrected 空 → 显式标「（删除）」，不再无箭头
+        content = pdf_pipeline._annotation_content(
+            finding, "属于", "", "【必改】")
+        self.assertEqual(
+            content, "【必改】 属于\n→（删除）\n分类：用词")
+        # 正常替换：显示 → 替换文本
+        content = pdf_pipeline._annotation_content(
+            finding, "卓越", "杰出", "【必改】")
+        self.assertEqual(
+            content, "【必改】 卓越\n→ 杰出\n分类：用词")
+
 
 if __name__ == "__main__":
     unittest.main()
