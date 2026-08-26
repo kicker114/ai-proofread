@@ -510,6 +510,31 @@ class PdfPipelineTest(unittest.TestCase):
         self.assertIn("alpha beta", converted)
         self.assertIn("gamma delta", converted)
 
+    def test_annot_class_maps_llm_findings_to_must_fix(self):
+        # LLM JSON 发现不带 fix_class；有实质修改 → must_fix（对齐 DOCX 路径），
+        # 无修改 → verify。
+        self.assertEqual(
+            pdf_pipeline._annot_class({
+                "phase": "1_llm",
+                "original": "尔茨海默病的安东尼",
+                "suggestion": "阿尔茨海默病的安东尼",
+            }), "must_fix")
+        self.assertEqual(
+            pdf_pipeline._annot_class({
+                "phase": "1_llm",
+                "original": "一样",
+                "suggestion": "一样",
+            }), "verify")
+        # 其余阶段仍按 phase 前缀推断，不受影响。
+        self.assertEqual(
+            pdf_pipeline._annot_class({
+                "phase": "0b_variant", "original": "子细", "suggestion": "仔细",
+            }), "variant")
+        self.assertEqual(
+            pdf_pipeline._annot_class({
+                "phase": "0a_tgscc", "char": "藉", "suggestion": "借",
+            }), "tgscc")
+
 
 if __name__ == "__main__":
     unittest.main()

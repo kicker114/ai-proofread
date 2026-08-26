@@ -221,6 +221,10 @@ def _annot_class(f: dict) -> str:
         return "structure"
     if "names" in phase:
         return "names"
+    if "1_llm" in phase:
+        # LLM JSON 发现不带 fix_class；原文≠建议即有实质修改 → must_fix，
+        # 与 DOCX 路径 _findings_to_issues 的 must_fix 路由保持一致。
+        return "must_fix" if _extract_original(f) != _extract_corrected(f) else "verify"
     return "verify"
 
 
