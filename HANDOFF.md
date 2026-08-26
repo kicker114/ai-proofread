@@ -1,28 +1,26 @@
-# HANDOFF — ai-proofread 审校 CLI 当前状态（2026-08-10）
+# HANDOFF — ai-proofread 审校 CLI 当前状态（2026-08-27）
 
 **Scope:** `/Users/kicker114/Developer/ai-proofread`
-**Branch / HEAD:** `main` / `f20ee89`（DeepSeek thinking-disabled 已提交）
-**Status:** 工作树有一批 failover 改造未提交；skill 改造（publish/political → WorkBuddy）待下次。
+**Branch / HEAD:** `main` / `1d4697c`（【依据】reason 回落修复）
+**Status:** 工作树干净（仅 `.workbuddy/memory/2026-08-10.md` 为 WorkBuddy 记录，untracked、勿动）。
 
 ---
 
-## 当前工作树状态（未提交）
+## 最近提交（2026-08-26）
 
-以下 failover 改造已完成并通过全量回归（151 项 + 固定样本），**尚未提交**：
+failover 改造（`--failover-models` 多 provider 切换 + JSON 对象包装 + 看门狗预算 +
+端到端回写用例 + executor shutdown 重建）已全部落库：`6719927` / `fd8ea26` / `d714ec6`。
 
-| 文件 | 改动 |
-|------|------|
-| `src/proofreader.py` | `_MODEL_PARAMS` 每模型参数块（thinking-disabled / response_format / temperature=None）；`_client_config` 扩展 4 provider（DeepSeek 直连、阿里云 dashscope、Moonshot、智谱）；`deepseek_async` 加 `models` 列表 failover 循环 + `provider_failovers` 统计 |
-| `src/max_pipeline.py` | 输出契约 `{"findings":[...]}` 对象包装（`_json_extract` 语义反转）；checkpoint identity 剥离 `model` 键（跨 provider 共享）；`run_max`/`phase1`/`worker` 透传 `models` |
-| `src/resource/prompt-proofreader-system-outputJSON.xml` | `<EXAMPLE_JSON_OUTPUT>` 改为 `{"findings":[...]}` 包装 |
-| `src/cli.py` | `AVAILABLE_MODELS` 加 `qwen3.8-max`/`kimi-k2.6`/`glm-4.7`；max 子命令加 `--failover-models` |
-| `tests/test_network_resume.py` | identity 去 model；新增 findings 对象 / failover 切换 / 单模型用例 |
-| `tests/test_skip_visibility.py` | fake_json 改对象契约 |
-| `CLAUDE.md` / `README.md` | 契约 + failover 文档 |
+随后两轮 writeback 质量修复也已提交：
 
-**验证**：全量 `unittest` 151 项绿、固定样本 `validate_synthetic.py` 精确命中、`compileall` + `git diff --check` 通过；真实 DeepSeek smoke（新对象契约）2.6s 成功返回 `{"findings":[...]}`。
+| Commit | 内容 |
+|--------|------|
+| `8201f07` | XML 1.0 非法控制字符剥离（`_xml_safe`，防 lxml `ValueError` 崩溃）+ 批注高亮收束到字符级差异块（`_min_change_span`，commentRange 与高亮解耦） |
+| `1d4697c` | `_findings_to_issues` 的 `reason` 不再回落到整句 `original`（LLM 发现无 reason → 批注省去 `◎ 依据`；异形词依据改用 `basis` 词典来源） |
 
-> 注：`.workbuddy/memory/2026-08-10.md` 为 untracked（用户 WorkBuddy 记录），提交时保留不误动。
+**验证**：全量 `unittest` 157 项绿 + 固定样本 `validate_synthetic.py` 精确命中。
+
+> 注：`.workbuddy/memory/2026-08-10.md` 为 WorkBuddy 记录（untracked），提交时保留不误动。
 
 ---
 
@@ -50,6 +48,26 @@
 - WorkBuddy 用自己格式（`.workbuddy/agents/`、`~/.workbuddy/skills/`、marketplace），app 不引用 `.claude/skills/`。
 - **已有先例**：ai-proofread 的 `.workbuddy/agents/pdf-proofreader.md`（frontmatter: `name/description/model/tools/color` + 正文指令）驱动 `proofread` CLI 做 PDF 审校。
 - 因此让 publish/political 可被 WorkBuddy 使用 = 各写一个 `.workbuddy/agents/` 定义，复用其确定性脚本 + 规则库，agent 编排用 WorkBuddy 替代 Claude dispatch。
+
+---
+
+## 关键洞察（2026-08-26，writeback 质量）
+
+### 4. LLM 发现不带 reason，不能把 original 当【依据】（`1d4697c`）
+
+- JSON 发现 prompt 明确禁止解释，`1_llm` finding 只有 `original_sentence` + `corrected_sentence`，无 `reason`。
+- `_findings_to_issues` 旧回退链 `reason or original or message` 把整句原文当 `reason`，批注 `◎ 依据` 与 `▶ 建议`（校正后整句）几乎逐字相同 → 冗余重复引述。
+- **修复**：回退链改用 `reason or basis or message`；LLM 发现 reason 为空 → `build_comment_xml` 因 `evidence` 空不再渲染 `◎ 依据` 行；`0b_variant` 的真实依据在 `basis`（词典来源），从原词改为词典名。
+
+### 5. XML 1.0 非法控制字符会击穿 lxml `.text=`（`8201f07`）
+
+- LLM 输出/离线数据可能夹带 `\x00-\x1f` 等控制字符，直接 `element.text = s` 抛 `ValueError`，整个写回中断。
+- **修复**：`load_findings` 用 `_xml_safe` 对 `cur/sug/reason/description/category` 统一剥离非法控制字符后再赋值。凡做 OOXML/XML 写回都应前置此类清洗。
+
+### 6. 批注高亮与 commentRange 必须解耦（`8201f07`）
+
+- 需求：高亮框选要字符级（只框 `current↔suggested` 差异块），但 commentRange 若也锚到差异块，会插入 `commentRangeStart/End` 截断 `current`，导致 `apply_track_change` 的 `_locate_safe_span` 重定位失败（前一轮 3 个测试回归）。
+- **修复**：`_min_change_span` 只决定高亮区间；commentRange 仍锚定整段 `current`（`current_runs[0]`/`[-1]`），两套 run 克隆分离。凡「修订 + 批注」同段写回都要注意这个锚定分离。
 
 ---
 

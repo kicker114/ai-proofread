@@ -200,12 +200,22 @@ The **02 engine** (default) manipulates DOCX directly via `lxml` + `zipfile` —
 2. For `must_fix` findings: `difflib` character-level diff → split only the
    affected direct text runs → `<w:del>/<w:ins>` track changes + styled
    `<w:comment>`. Unaffected runs and properties remain byte-structurally intact.
+   The comment **highlight** is separately minimized: `_min_change_span(cur, sug)`
+   frames only the actual diff block (not the whole sentence), while
+   `commentRangeStart/End` still anchor the full `current` — deliberately decoupled
+   so `apply_track_change`'s `_locate_safe_span` re-location of `current` is not
+   broken by highlight boundaries.
 3. For `polish`/`verify` findings: highlight + comment only, no text change.
 4. Preserves existing revisions (accept-view text via `_para_raw_text()` — includes `<w:ins>`, excludes `<w:del>` ancestors). A target crossing a hyperlink, field, tab/drawing, content control, protected range, or existing revision is downgraded to a comment rather than rewritten. Declared P locations never fall back to another paragraph, fuzzy P resolution is comment-only, and an amplitude budget blocks short-anchor sentence expansion.
 5. Runs a package audit before success: ZIP/XML parse, relationship targets,
    comment marker/reference IDs, revision author/date/text, and dangling modern
    comment parts. Each invocation uses isolated findings staging and atomically
    replaces the requested output only after the audit passes.
+6. `load_findings` sanitizes every `cur/sug/reason/description/category` through
+   `_xml_safe`, which strips XML 1.0 illegal control chars
+   (`\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x84\x86-\x9f￾￿`) before any `lxml`
+   `.text =` assignment — otherwise a finding carrying such bytes raises
+   `ValueError` and aborts the whole writeback.
 
 **P-numbering must be byte-identical** between the 02 engine and `max_pipeline._build_para_text_map()`. Both use the same `_para_raw_text()` logic and walk body children identically. Finding location strings like `P3` map directly to these paragraph indices.
 Word max captures the source DOCX hash before review, stores it in
@@ -217,6 +227,13 @@ The `fix_class` routing:
 - `must_fix` → character-level track changes + comment
 - `polish` → comment only (TGSCC single-char fixes — avoid false matches)
 - `verify` → comment only (pending human verification)
+
+`_findings_to_issues` (max pipeline findings → issues) does **not** fall `reason`
+back to the full `original` sentence. LLM findings carry no `reason` (the JSON
+discovery prompt forbids explanations), so their `reason` stays empty and the
+comment omits the `◎ 依据` line instead of duplicating the original full sentence
+alongside `▶ 建议`. `0b_variant` findings use `basis` (dictionary source, e.g.
+「现代汉语词典/异形词表」) as their `reason`.
 
 The old **Adeu MCP** path (`src/writeback.py`, `--engine adeu`) requires Claude Code agent context and is retained for compatibility.
 
