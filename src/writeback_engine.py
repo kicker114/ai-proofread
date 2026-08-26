@@ -104,6 +104,15 @@ def anchor_window(text, vpos, vlen):
 
 
 # ── load findings ─────────────────────────────────────────────────────────
+_XML_INVALID_RE = re.compile(
+    r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x84\x86-\x9f￾￿]')
+
+
+def _xml_safe(text: str) -> str:
+    """Strip XML 1.0-illegal characters (LLM output can carry control chars)."""
+    return _XML_INVALID_RE.sub('', text) if text else text
+
+
 def load_findings(results_dir):
     """Load all results/*.json, keep only issues with fix_class + location + current."""
     findings = []
@@ -114,8 +123,8 @@ def load_findings(results_dir):
         for issue in issues:
             fc = str(issue.get('fix_class', '')).strip()
             loc = str(issue.get('location', '')).strip()
-            cur = str(issue.get('current', '')).strip()
-            sug = str(issue.get('suggested', '')).strip()
+            cur = _xml_safe(str(issue.get('current', '')).strip())
+            sug = _xml_safe(str(issue.get('suggested', '')).strip())
             if not fc or not loc or not cur:
                 continue
             pn = _extract_pn(loc)
@@ -127,9 +136,9 @@ def load_findings(results_dir):
                 'pn': pn,
                 'current': cur,
                 'suggested': sug,
-                'reason': str(issue.get('reason', '')).strip(),
-                'description': str(issue.get('description', '')).strip(),
-                'category': str(issue.get('category', '')).strip(),
+                'reason': _xml_safe(str(issue.get('reason', '')).strip()),
+                'description': _xml_safe(str(issue.get('description', '')).strip()),
+                'category': _xml_safe(str(issue.get('category', '')).strip()),
             })
     return findings
 
@@ -539,6 +548,44 @@ def _top_level_child(para, node):
     return node
 
 
+def _min_change_span(cur, sug):
+    """返回 current 中真正变化的字符区间 [start, end)（高亮最小化）。
+
+    LLM 常报整句/大短语，导致批注高亮框选一大片。用 difflib 求
+    current↔suggested 的最小差异块，把高亮 + commentRange 从整段缩到
+    「实际变化的字」，而不是整个 current。
+
+    返回 (start, end)（0-based 半开区间），或 None（不缩小）：
+      - 无 suggested（verify 类不改文）→ 保持整段
+      - 差异块覆盖 ≥80% current → 本就是大改，缩小无意义
+      - 差异块为空 → 保持整段
+    """
+    if not sug:
+        return None
+    from difflib import SequenceMatcher
+    sm = SequenceMatcher(None, cur, sug, autojunk=False)
+    blocks = []
+    for tag, i1, i2, _, _ in sm.get_opcodes():
+        if tag == 'equal':
+            continue
+        if tag == 'insert':
+            # 纯插入：current 内无对应位置，用前一字符定位
+            if i1 > 0:
+                blocks.append((i1 - 1, i1))
+            continue
+        blocks.append((i1, i2))  # delete / replace
+    if not blocks:
+        return None
+    start = min(b[0] for b in blocks)
+    end = max(b[1] for b in blocks)
+    span_len = end - start
+    if span_len <= 0:
+        return None
+    if span_len * 10 >= len(cur) * 8:
+        return None  # 覆盖 ≥80% current
+    return start, end
+
+
 def apply_annotation(para, current, fix_class, rid, author, date_iso, suggested='', reason='', description='', category=''):
     """Apply yellow highlight + comment to `current` in the paragraph.
 
@@ -552,15 +599,34 @@ def apply_annotation(para, current, fix_class, rid, author, date_iso, suggested=
         cpos, c_end, intervals, affected = located
         first_start, _, first_run, first_text = affected[0]
         _, last_end, last_run, last_text = affected[-1]
+        # 高亮最小化：把框选从整个 current 缩到 current↔suggested 的实际差异块
+        span = _min_change_span(current, suggested)
+        hl_start = cpos + span[0] if span else cpos
+        hl_end = cpos + span[1] if span else c_end
         replacements = []
+        # current 覆盖 cpos..c_end 的 run（用于 commentRange 锚定整段原文），
+        # 与高亮块（highlighted）分离：高亮只框差异块，commentRange 仍锚整段 current，
+        # 这样 apply_track_change 后续 _locate_safe_span 重定位 current 不被注释标记截断。
+        current_runs = []
         prefix = first_text[:cpos - first_start]
         if prefix:
             replacements.append(_clone_text_run(first_run, prefix))
+        # 差异块之前（cpos..hl_start）不高亮
+        for run, text in _source_run_pieces(intervals, cpos, hl_start):
+            clone = _clone_text_run(run, text)
+            replacements.append(clone)
+            current_runs.append(clone)
         highlighted = []
-        for run, text in _source_run_pieces(intervals, cpos, c_end):
+        for run, text in _source_run_pieces(intervals, hl_start, hl_end):
             clone = _clone_text_run(run, text, highlight='yellow')
             replacements.append(clone)
             highlighted.append(clone)
+            current_runs.append(clone)
+        # 差异块之后（hl_end..c_end）不高亮
+        for run, text in _source_run_pieces(intervals, hl_end, c_end):
+            clone = _clone_text_run(run, text)
+            replacements.append(clone)
+            current_runs.append(clone)
         suffix = last_text[len(last_text) - (last_end - c_end):] if last_end > c_end else ''
         if suffix:
             replacements.append(_clone_text_run(last_run, suffix))
@@ -570,8 +636,8 @@ def apply_annotation(para, current, fix_class, rid, author, date_iso, suggested=
         for element in replacements:
             para.insert(insert_at, element)
             insert_at += 1
-        first_anchor = highlighted[0]
-        last_anchor = highlighted[-1]
+        first_anchor = current_runs[0]
+        last_anchor = current_runs[-1]
     else:
         # Annotation-only fallback for hyperlinks, fields, protected ranges, and
         # existing revisions. The nested structure remains byte-for-byte intact.

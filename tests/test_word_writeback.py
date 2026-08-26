@@ -1,6 +1,7 @@
 """Regression tests for character-level DOCX writeback and OOXML comments."""
 
 import hashlib
+import json
 import shutil
 import subprocess
 import tempfile
@@ -17,7 +18,9 @@ from docx.opc.constants import RELATIONSHIP_TYPE
 from lxml import etree
 
 from src.max_pipeline import _run_02_writeback
-from src.writeback_engine import DocxAuditError, W14, W15, audit_docx, mcn, qn
+from src.writeback_engine import (
+    DocxAuditError, W14, W15, _min_change_span, _xml_safe, audit_docx,
+    load_findings, mcn, qn)
 
 
 def _add_hyperlink(paragraph, text, url):
@@ -194,6 +197,78 @@ def _issues():
 
 
 class WordWritebackTests(unittest.TestCase):
+    def test_min_change_span_char_level(self):
+        # 单字替换：只框「字」
+        self.assertEqual(_min_change_span("错别字", "错别词"), (2, 3))
+        # 两字替换
+        self.assertEqual(_min_change_span("法宝", "法器"), (1, 2))
+        # 纯尾部删除：框被删字
+        self.assertEqual(_min_change_span("abcd", "abc"), (3, 4))
+        # 中间插入：框插入点前一字符
+        self.assertEqual(_min_change_span("那年", "那一年"), (0, 1))
+        # 段首插入：current 无对应位置 → 不缩小
+        self.assertIsNone(_min_change_span("abc", "xabc"))
+        # 大改（≥80%）：本就是大改，不缩小
+        self.assertIsNone(_min_change_span("这是一个完整的句子", "完全不同的另一句话"))
+        # verify 类（无 suggested）：不缩小
+        self.assertIsNone(_min_change_span("原文", ""))
+        self.assertIsNone(_min_change_span("原文", "原文"))
+
+    def test_xml_control_chars_sanitized(self):
+        # \x0c（换页符）等 XML 1.0 非法控制字符被剥离
+        self.assertEqual(
+            _xml_safe("One Hund\x0credYearsofSolitude"),
+            "One HundredYearsofSolitude")
+        self.assertEqual(_xml_safe("错字\x0b"), "错字")
+        self.assertEqual(_xml_safe(""), "")
+        self.assertEqual(_xml_safe("正常文本"), "正常文本")
+
+        with tempfile.TemporaryDirectory() as temp:
+            d = Path(temp)
+            (d / "max_findings.json").write_text(json.dumps({
+                "issues": [{
+                    "fix_class": "must_fix",
+                    "location": "P0",
+                    "current": "错字\x0c",
+                    "suggested": "正字\x0b",
+                    "reason": "控制字符\x07",
+                    "category": "文字",
+                }]
+            }, ensure_ascii=False), encoding="utf-8")
+            findings = load_findings(str(d))
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0]["current"], "错字")
+            self.assertEqual(findings[0]["suggested"], "正字")
+            self.assertEqual(findings[0]["reason"], "控制字符")
+
+    def test_annotation_highlights_only_diff_block(self):
+        # 降级批注（polish 恒走批注）在长句上只高亮差异块，而非整句框选。
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "char-span.docx"
+            output = root / "review.docx"
+            doc = Document()
+            doc.add_paragraph("这是一个很长的句子里面有个错字需要修正")
+            doc.save(source)
+
+            current = "这是一个很长的句子里面有个错字需要修正"
+            suggested = "这是一个很长的句子里面有个正字需要修正"  # 错 → 正
+            _run_02_writeback(
+                str(source), "char-span", [{
+                    "fix_class": "polish", "location": "P0",
+                    "current": current, "suggested": suggested,
+                    "reason": "错字", "category": "润色",
+                }], "Codex审校", out_path=str(output))
+
+            with zipfile.ZipFile(output) as package:
+                document = etree.fromstring(package.read("word/document.xml"))
+            highlighted = [
+                "".join(t.text or "" for t in run.iter(qn("t")))
+                for run in document.iter(qn("r"))
+                if run.find(qn("rPr") + "/" + qn("highlight")) is not None
+            ]
+            self.assertEqual(highlighted, ["错"])
+
     def test_preserves_runs_and_builds_valid_comments(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
