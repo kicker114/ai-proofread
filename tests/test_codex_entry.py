@@ -107,6 +107,32 @@ class CodexEntryTests(unittest.TestCase):
         self.assertEqual(issues[0]["fix_class"], "verify")
         self.assertEqual(issues[0]["category"], "定位待核")
 
+    def test_llm_reason_not_fallback_to_full_original(self):
+        # LLM 发现不带 reason（prompt 禁止解释），【依据】不得回落到整句原文，
+        # 否则会与【建议】几乎一模一样的重复引述。
+        issues = _findings_to_issues([{
+            "phase": "1_llm",
+            "type": "correction",
+            "original": "一个人仍然活着，却渐渐失去了构成属于自己灵魂的一切。",
+            "suggestion": "一个人仍然活着，却渐渐失去了构成自己灵魂的一切。",
+            "location": "P3",
+        }])
+        self.assertEqual(issues[0]["fix_class"], "must_fix")
+        self.assertEqual(issues[0]["reason"], "")
+
+    def test_variant_reason_uses_basis_not_original(self):
+        # variants 的真实依据在 basis（词典来源），不应回落到 original 原词。
+        issues = _findings_to_issues([{
+            "phase": "0b_variant",
+            "type": "variant_form",
+            "original": "子细",
+            "suggestion": "仔细",
+            "location": "P5",
+            "basis": "现代汉语词典/异形词表",
+        }])
+        self.assertEqual(issues[0]["fix_class"], "must_fix")
+        self.assertEqual(issues[0]["reason"], "现代汉语词典/异形词表")
+
 
 if __name__ == "__main__":
     unittest.main()

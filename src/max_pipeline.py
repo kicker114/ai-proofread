@@ -463,7 +463,10 @@ def _findings_to_issues(findings: List[Dict]) -> List[Dict]:
         # 兼容 suggestion / suggested 两个字段名（max 用 suggestion，pub 用 suggested）
         suggested = (f.get("suggested") or f.get("suggestion") or "").strip()
         location = f.get("location") or f"P{f.get('pn', 0)}"
-        reason = (f.get("reason") or f.get("original") or f.get("message") or "").strip()
+        # LLM 发现不带 reason（prompt 禁止解释），不能回落到 full original 句子，
+        # 否则【依据】会整句重复引述原文，与【建议】几乎一模一样。variants 的真实
+        # 依据在 basis（词典来源），故这里用 basis 而非 original。
+        reason = (f.get("reason") or f.get("basis") or f.get("message") or "").strip()
 
         if phase.startswith("0c_structure"):
             continue  # 结构诊断在 max report 呈现，不写回 DOCX
