@@ -59,6 +59,9 @@ def _raw_text_coverage(raw_text: str, markdown_text: str) -> float:
 
 # 句末标点：行尾若是这些标点，视为自然段落边界，不参与折行拼接。
 _SENTENCE_END = set("。！？…；：」』】\"'”’")
+# 零宽字符：PDF 文字层常夹带，既不可见又会在去空白匹配时造成「索引有、提取无」
+# 的不一致，故索引与提取两侧统一剔除。
+_ZERO_WIDTH = set("​‌‍﻿")
 # 结构性行前缀：标题 / 分隔线 / 表格 / 引用 / 列表，不参与折行拼接。
 _STRUCT_LINE_RE = re.compile(
     r"^\s*(?:#{1,6}|\*{3,}|-{3,}|_{3,}|~{3,}|\|+|>|[-\*+]\s|\d+[.、．])"
@@ -315,7 +318,7 @@ def _build_text_index(doc) -> tuple[str, list[tuple[int, int, "fitz.Quad"]]]:
     line_id = 0
     for pno in range(len(doc)):
         page = doc[pno]
-        d = page.get_text("rawdict", sort=True)
+        d = page.get_text("rawdict", sort=False)
         for block in d.get("blocks", []):
             if block.get("type") != 0:  # 非文本块（图片等）跳过
                 continue
@@ -326,7 +329,7 @@ def _build_text_index(doc) -> tuple[str, list[tuple[int, int, "fitz.Quad"]]]:
                 for span in line.get("spans", []):
                     for char in span.get("chars", []):
                         value = char.get("c", "")
-                        if not value or not value.strip():
+                        if not value or not value.strip() or value in _ZERO_WIDTH:
                             continue
                         try:
                             quad = fitz.recover_char_quad(line_dir, span, char)
