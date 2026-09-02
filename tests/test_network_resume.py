@@ -35,7 +35,10 @@ class NetworkRetryTests(unittest.IsolatedAsyncioTestCase):
         _, kwargs = factory.call_args
         self.assertEqual(kwargs["api_key"],
                          proofreader.os.getenv("DEEPSEEK_API_KEY"))
-        self.assertEqual(kwargs["base_url"], "https://api.deepseek.com")
+        self.assertEqual(
+            kwargs["base_url"],
+            "https://www.cloud-datai.com/ai-api/v1",
+        )
         self.assertEqual(kwargs["max_retries"], 0)
         self.assertEqual(kwargs["timeout"], proofreader.API_TIMEOUT_SECONDS)
         # 强制直连：显式 http_client + proxy=None，不受环境/沙箱代理影响

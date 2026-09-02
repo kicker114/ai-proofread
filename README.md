@@ -42,16 +42,16 @@ $ai-proofread 用 codex-native 模式审校 /绝对路径/书稿.pdf，并联网
 
 ### 2. 配置 API Key
 
-在 `src/` 下新建 `.env`：
+本仓库不加载或保留项目内的 `.env` 密钥文件。需要调用模型时，在启动命令的
+进程环境中显式提供所需密钥，或由外部密钥管理工具注入：
 
-```txt
-# src/.env
-DEEPSEEK_API_KEY=sk-你的key
-GOOGLE_API_KEY=           # 可选，Google 模型才需要
-ALIYPUN_API_KEY=          # 可选，阿里云百炼才需要
+```zsh
+DEEPSEEK_API_KEY='你的_cloud_datai_key' \
+  proofread p /绝对路径/书稿.docx
 ```
 
-> ⚠️ 该文件已被 `.gitignore` 忽略，不会提交到仓库。
+`DEEPSEEK_BASE_URL` 可选；不设置时使用项目的默认兼容端点。Google、百炼、
+Moonshot 和智谱模型分别只在实际使用时读取其对应的运行时环境变量。
 
 ### 3. 词典（可选，启用专名查词）
 
@@ -394,7 +394,8 @@ macOS Homebrew Python 需加 `--break-system-packages`。
 需在项目根目录运行，或先 `pip install -e .`。
 
 **Q: max 模式 Phase 1 返回空？**
-检查 `src/.env` 的 `DEEPSEEK_API_KEY` 是否配置正确，网络能否访问 `api.deepseek.com`（需在代理 NO_PROXY 白名单或关闭代理）。
+检查启动 `proofread` 的进程是否获得 `DEEPSEEK_API_KEY`，以及网络能否访问
+`www.cloud-datai.com`（需在代理 `NO_PROXY` 白名单或关闭代理）。
 
 **Q: 词典查询很慢？**
 首次会解包建 `.db`，之后走缓存。词典文件权限不足（`chmod`）也会导致问题。

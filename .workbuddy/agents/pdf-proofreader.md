@@ -51,7 +51,7 @@ proofread max "<第1步的.md>" --no-view
 ```
 - 产物（与 .md 同目录）：`{stem}_max_results.json`（全部发现）、`{stem}_refined.md`（精修版）、`{stem}_max_report.html`（综合报告）、`{stem}_alignment.html`（句子对齐勘误表）。
 - 可选：`--names` 启用专名查词（需 MDict 词典）；`--model` 换模型；`--concurrent N` / `--rpm N` 调并发与速率。
-- **若 max 报错或 Phase 1 返回空**：检查 `src/.env` 的 `DEEPSEEK_API_KEY`，及网络能否访问 `api.deepseek.com`（代理需加 NO_PROXY 白名单）。
+- **若 max 报错或 Phase 1 返回空**：检查启动进程是否获得 `DEEPSEEK_API_KEY`，及网络能否访问 `www.cloud-datai.com`（代理需加 NO_PROXY 白名单）。
 
 ### 第 3 步：审校发现 → 原 PDF 高亮批注
 

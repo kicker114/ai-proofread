@@ -15,10 +15,10 @@ from openai.types.chat import (
     ChatCompletionSystemMessageParam,
     ChatCompletionToolParam
 )
-from dotenv import load_dotenv
-
-# 加载环境变量，用于安全地管理API密钥
-load_dotenv()
+DEEPSEEK_BASE_URL = os.getenv(
+    "DEEPSEEK_BASE_URL",
+    "https://www.cloud-datai.com/ai-api/v1",
+).rstrip("/")
 
 # 定义函数规范，使用JSON Schema格式描述函数的参数和返回值
 # 这里定义了一个查词典的函数规范
@@ -105,7 +105,10 @@ def send_messages(
         ChatCompletionMessage: API的响应消息
     """
     # 初始化OpenAI客户端
-    client = OpenAI(api_key=os.getenv("DEEPSEEK_API_KEY"), base_url="https://api.deepseek.com")
+    client = OpenAI(
+        api_key=os.getenv("DEEPSEEK_API_KEY"),
+        base_url=DEEPSEEK_BASE_URL,
+    )
 
     # 调用API
     response = client.chat.completions.create(

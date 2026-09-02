@@ -29,13 +29,6 @@ import sys
 import webbrowser
 from pathlib import Path
 from typing import Optional
-from dotenv import load_dotenv
-
-# 加载环境变量（src/.env 中的 DEEPSEEK_API_KEY）
-_SRC_DIR = Path(__file__).resolve().parent
-_ENV_PATH = _SRC_DIR / ".env"
-load_dotenv(str(_ENV_PATH))
-
 DEFAULT_MODEL = "deepseek-v4-flash"
 AVAILABLE_MODELS = [
     "deepseek-v4-flash",

@@ -16,13 +16,16 @@ After install, `proofread` is globally available. The entry point is `src/cli.py
 
 ## API keys
 
-Place in `src/.env` (gitignored):
+This repository does not load or retain project-local API key files. Provide
+credentials explicitly in the invoking process environment or through an
+external secret manager. For example:
 
+```zsh
+DEEPSEEK_API_KEY='...' proofread p /absolute/path/to/manuscript.docx
 ```
-DEEPSEEK_API_KEY=sk-...
-GOOGLE_API_KEY=        # optional
-ALIYPUN_API_KEY=       # optional (Aliyun Bailian, for deepseek-v3)
-```
+
+`GOOGLE_API_KEY`, `ALIYPUN_API_KEY`, `MOONSHOT_API_KEY`, and `ZHIPU_API_KEY`
+are likewise opt-in runtime variables for the models that require them.
 
 ## CLI commands (from project root)
 
@@ -268,7 +271,7 @@ The old **Adeu MCP** path (`src/writeback.py`, `--engine adeu`) requires Claude 
 
 ```
 deepseek-v4-flash / deepseek-v4-pro / deepseek-chat / deepseek-reasoner
-  → api.deepseek.com via OpenAI client
+  → www.cloud-datai.com/ai-api/v1 via OpenAI client
 
 deepseek-v3
   → Aliyun Bailian (dashscope.aliyuncs.com)

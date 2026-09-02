@@ -18,10 +18,12 @@ import httpx
 from google import genai
 from google.genai import types
 from openai import OpenAI
-from dotenv import load_dotenv
-
-# 加载环境变量
-load_dotenv()
+# DeepSeek-compatible gateway. Override with DEEPSEEK_BASE_URL for a local or
+# provider-specific endpoint without changing the model routing code.
+DEEPSEEK_BASE_URL = os.getenv(
+    "DEEPSEEK_BASE_URL",
+    "https://www.cloud-datai.com/ai-api/v1",
+).rstrip("/")
 
 # 读取提示文件（相对于模块自身路径，支持从任何 CWD 调用）
 _PROMPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resource")
@@ -110,7 +112,7 @@ def _client_config(model: str) -> tuple[str, str | None, str]:
         "deepseek-chat", "deepseek-reasoner",
     }
     if model in direct_models:
-        return "deepseek", os.getenv("DEEPSEEK_API_KEY"), "https://api.deepseek.com"
+        return "deepseek", os.getenv("DEEPSEEK_API_KEY"), DEEPSEEK_BASE_URL
     if model in ("deepseek-v3", "qwen3.8-max"):
         # dashscope 兼容端点：deepseek-v3 与 qwen 走同一 provider client（池化复用）
         return (
